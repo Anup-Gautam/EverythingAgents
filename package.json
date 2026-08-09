@@ -1,0 +1,30 @@
+{
+  "name": "coco",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Coco — floating session companion orb",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "npm run build:electron && concurrently -k \"vite\" \"npm:build:electron:watch\" \"npm:electron:dev\"",
+    "electron:dev": "wait-on tcp:5174 && env -u ELECTRON_RUN_AS_NODE electron .",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "build:electron:watch": "tsc -p tsconfig.electron.json --watch --preserveWatchOutput",
+    "build": "npm run build:electron && vite build",
+    "start": "npm run dev"
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "electron": "^34.0.0",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.7",
+    "wait-on": "^8.0.2"
+  }
+}
