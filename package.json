@@ -5,7 +5,9 @@
   "description": "Coco — floating session companion orb",
   "main": "dist-electron/main.js",
   "scripts": {
-    "dev": "npm run build:electron && concurrently -k \"vite\" \"npm:build:electron:watch\" \"npm:electron:dev\"",
+    "postinstall": "node scripts/patch-electron-plist.mjs",
+    "patch:plist": "node scripts/patch-electron-plist.mjs",
+    "dev": "npm run patch:plist && npm run build:electron && concurrently -k \"vite\" \"npm:build:electron:watch\" \"npm:electron:dev\"",
     "electron:dev": "wait-on tcp:5174 && env -u ELECTRON_RUN_AS_NODE electron .",
     "build:electron": "tsc -p tsconfig.electron.json",
     "build:electron:watch": "tsc -p tsconfig.electron.json --watch --preserveWatchOutput",
