@@ -1,6 +1,7 @@
 import {
   app,
   BrowserWindow,
+  clipboard,
   desktopCapturer,
   globalShortcut,
   ipcMain,
@@ -13,17 +14,24 @@ import {
 } from "electron";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 const COMPACT_WIDTH = 128;
 const COMPACT_HEIGHT = 150;
 const PICKER_WIDTH = 360;
 const PICKER_HEIGHT = 440;
+const COMMAND_WIDTH = 320;
+const COMMAND_HEIGHT = 210;
 const EDGE_MARGIN = 10;
 const THUMB_SIZE = { width: 320, height: 180 };
 const ANIM_MS = 220;
 const ANIM_FPS = 60;
 const SCREENSHOT_HOTKEY = "CommandOrControl+Shift+S";
 const RECORDING_HOTKEY = "CommandOrControl+Shift+R";
+const NOTE_HOTKEY = "CommandOrControl+Shift+N";
+const COMMAND_HOTKEY = "CommandOrControl+Shift+C";
+const PTT_HOTKEY = "CommandOrControl+Shift+Space";
+const CLIPBOARD_POLL_MS = 300;
 
 type MenuAction =
   | "end_session"
@@ -32,7 +40,7 @@ type MenuAction =
   | "settings"
   | "change_source";
 
-type WindowLayout = "compact" | "picker";
+type WindowLayout = "compact" | "picker" | "command";
 type SourceType = "screen" | "window";
 type ScreenAccess = ReturnType<typeof systemPreferences.getMediaAccessStatus>;
 
@@ -51,9 +59,22 @@ type SourcesListResult = {
 };
 
 type ActiveSession = {
+  id: string;
   sourceId: string;
   sourceType: SourceType;
   sourceLabel: string;
+  startedAt: number;
+};
+
+type SessionEventType = "note_silent" | "screenshot" | "recording";
+
+type SessionEvent = {
+  id: string;
+  type: SessionEventType;
+  timestamp: number;
+  text?: string;
+  filePath?: string;
+  fileName?: string;
 };
 
 type ScreenshotResult =
@@ -64,11 +85,19 @@ type RecordingSaveResult =
   | { ok: true; filePath: string; fileName: string }
   | { ok: false; error: string };
 
+type NoteSilentResult =
+  | { ok: true; event: SessionEvent; preview: string }
+  | { ok: false; error: string };
+
 let orbWindow: BrowserWindow | null = null;
 let currentLayout: WindowLayout = "compact";
 let animTimer: ReturnType<typeof setInterval> | null = null;
 let activeSession: ActiveSession | null = null;
 let isRecording = false;
+let sessionEvents: SessionEvent[] = [];
+let currentSelection: string | null = null;
+let lastClipboardText = "";
+let clipboardTimer: ReturnType<typeof setInterval> | null = null;
 
 /** Keep the orb above fullscreen apps and across all macOS Spaces. */
 function applyOverlayBehavior(win: BrowserWindow): void {
@@ -86,9 +115,13 @@ function applyOverlayBehavior(win: BrowserWindow): void {
 }
 
 function layoutSize(layout: WindowLayout): { width: number; height: number } {
-  return layout === "picker"
-    ? { width: PICKER_WIDTH, height: PICKER_HEIGHT }
-    : { width: COMPACT_WIDTH, height: COMPACT_HEIGHT };
+  if (layout === "picker") {
+    return { width: PICKER_WIDTH, height: PICKER_HEIGHT };
+  }
+  if (layout === "command") {
+    return { width: COMMAND_WIDTH, height: COMMAND_HEIGHT };
+  }
+  return { width: COMPACT_WIDTH, height: COMPACT_HEIGHT };
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -305,6 +338,28 @@ function showOrbContextMenu(): void {
       },
     },
     {
+      label: "Note this",
+      accelerator: "CommandOrControl+Shift+N",
+      enabled: Boolean(activeSession),
+      click: () => {
+        void noteSilent();
+      },
+    },
+    {
+      label: "Command…",
+      accelerator: "CommandOrControl+Shift+C",
+      click: () => {
+        orbWindow?.webContents.send("command:toggle");
+      },
+    },
+    {
+      label: "Push to talk",
+      accelerator: "CommandOrControl+Shift+Space",
+      click: () => {
+        orbWindow?.webContents.send("command:ptt");
+      },
+    },
+    {
       label: "End session",
       click: () => sendMenuAction("end_session"),
     },
@@ -341,6 +396,126 @@ function screenshotsDir(): string {
 
 function recordingsDir(): string {
   return path.join(app.getPath("pictures"), "Coco", "recordings");
+}
+
+function sessionsDir(): string {
+  return path.join(app.getPath("pictures"), "Coco", "sessions");
+}
+
+function previewText(text: string, max = 42): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (compact.length <= max) return compact;
+  return `${compact.slice(0, max - 1)}…`;
+}
+
+function appendSessionEvent(
+  event: Omit<SessionEvent, "id" | "timestamp"> & {
+    id?: string;
+    timestamp?: number;
+  },
+): SessionEvent {
+  const full: SessionEvent = {
+    id: event.id ?? randomUUID(),
+    type: event.type,
+    timestamp: event.timestamp ?? Date.now(),
+    text: event.text,
+    filePath: event.filePath,
+    fileName: event.fileName,
+  };
+  sessionEvents.push(full);
+  return full;
+}
+
+async function persistSessionLog(): Promise<string | null> {
+  if (!activeSession || sessionEvents.length === 0) return null;
+
+  const dir = sessionsDir();
+  await fs.mkdir(dir, { recursive: true });
+  const filePath = path.join(dir, `${activeSession.id}.json`);
+  const payload = {
+    session: activeSession,
+    events: sessionEvents,
+    savedAt: Date.now(),
+  };
+  await fs.writeFile(filePath, JSON.stringify(payload, null, 2), "utf8");
+  return filePath;
+}
+
+function stopClipboardWatcher(): void {
+  if (clipboardTimer !== null) {
+    clearInterval(clipboardTimer);
+    clipboardTimer = null;
+  }
+}
+
+function startClipboardWatcher(): void {
+  stopClipboardWatcher();
+  // Baseline so pre-existing clipboard content is not treated as a fresh copy.
+  lastClipboardText = clipboard.readText();
+  currentSelection = null;
+
+  clipboardTimer = setInterval(() => {
+    if (!activeSession) return;
+
+    const next = clipboard.readText();
+    if (!next || next === lastClipboardText) return;
+
+    lastClipboardText = next;
+    currentSelection = next;
+    console.info("[coco] clipboard selection updated", {
+      length: next.length,
+      preview: previewText(next),
+    });
+  }, CLIPBOARD_POLL_MS);
+}
+
+function emitNoteResult(result: NoteSilentResult): void {
+  orbWindow?.webContents.send("notes:silent-result", result);
+}
+
+async function noteSilent(): Promise<NoteSilentResult> {
+  if (!activeSession) {
+    const result: NoteSilentResult = {
+      ok: false,
+      error: "Start a session first",
+    };
+    emitNoteResult(result);
+    return result;
+  }
+
+  const text = currentSelection?.trim() ?? "";
+  if (!text) {
+    const result: NoteSilentResult = {
+      ok: false,
+      error: "Copy text first, then Note this",
+    };
+    emitNoteResult(result);
+    return result;
+  }
+
+  const event = appendSessionEvent({
+    type: "note_silent",
+    text,
+  });
+
+  try {
+    await persistSessionLog();
+  } catch (err) {
+    console.warn("[coco] failed to persist session log", err);
+  }
+
+  const result: NoteSilentResult = {
+    ok: true,
+    event,
+    preview: previewText(text),
+  };
+  emitNoteResult(result);
+  console.info("[coco] note_silent saved", {
+    eventId: event.id,
+    preview: result.preview,
+    totalEvents: sessionEvents.length,
+  });
+  return result;
 }
 
 function requestToggleRecording(): void {
@@ -413,6 +588,15 @@ async function captureScreenshot(): Promise<ScreenshotResult> {
     await fs.writeFile(filePath, source.thumbnail.toPNG());
     shell.showItemInFolder(filePath);
 
+    appendSessionEvent({
+      type: "screenshot",
+      filePath,
+      fileName,
+    });
+    void persistSessionLog().catch((err) => {
+      console.warn("[coco] failed to persist session log", err);
+    });
+
     const result: ScreenshotResult = { ok: true, filePath, fileName };
     emitScreenshotResult(result);
     console.info("[coco] screenshot saved", result);
@@ -441,6 +625,27 @@ function registerCaptureHotkeys(): void {
   if (!recOk) {
     console.warn(`[coco] failed to register hotkey ${RECORDING_HOTKEY}`);
   }
+
+  const noteOk = globalShortcut.register(NOTE_HOTKEY, () => {
+    void noteSilent();
+  });
+  if (!noteOk) {
+    console.warn(`[coco] failed to register hotkey ${NOTE_HOTKEY}`);
+  }
+
+  const cmdOk = globalShortcut.register(COMMAND_HOTKEY, () => {
+    orbWindow?.webContents.send("command:toggle");
+  });
+  if (!cmdOk) {
+    console.warn(`[coco] failed to register hotkey ${COMMAND_HOTKEY}`);
+  }
+
+  const pttOk = globalShortcut.register(PTT_HOTKEY, () => {
+    orbWindow?.webContents.send("command:ptt");
+  });
+  if (!pttOk) {
+    console.warn(`[coco] failed to register hotkey ${PTT_HOTKEY}`);
+  }
 }
 
 async function saveRecording(payload: {
@@ -460,6 +665,17 @@ async function saveRecording(payload: {
 
     await fs.writeFile(filePath, Buffer.from(payload.bytes));
     shell.showItemInFolder(filePath);
+
+    if (activeSession) {
+      appendSessionEvent({
+        type: "recording",
+        filePath,
+        fileName,
+      });
+      void persistSessionLog().catch((err) => {
+        console.warn("[coco] failed to persist session log", err);
+      });
+    }
 
     const result: RecordingSaveResult = { ok: true, filePath, fileName };
     console.info("[coco] recording saved", result);
@@ -601,7 +817,13 @@ function registerIpc(): void {
   });
 
   ipcMain.handle("orb:set-layout", (_event, layout: WindowLayout) => {
-    if (layout !== "compact" && layout !== "picker") return currentLayout;
+    if (
+      layout !== "compact" &&
+      layout !== "picker" &&
+      layout !== "command"
+    ) {
+      return currentLayout;
+    }
     setWindowLayout(layout);
     return currentLayout;
   });
@@ -628,25 +850,67 @@ function registerIpc(): void {
     revealElectronApp();
   });
 
-  ipcMain.handle("session:set", (_event, session: ActiveSession | null) => {
-    if (
-      session &&
-      typeof session.sourceId === "string" &&
-      (session.sourceType === "screen" || session.sourceType === "window")
-    ) {
-      activeSession = {
-        sourceId: session.sourceId,
-        sourceType: session.sourceType,
-        sourceLabel: String(session.sourceLabel ?? "capture"),
-      };
-      return activeSession;
-    }
-    activeSession = null;
-    return null;
-  });
+  ipcMain.handle(
+    "session:set",
+    (
+      _event,
+      payload: {
+        sourceId: string;
+        sourceType: SourceType;
+        sourceLabel: string;
+      } | null,
+    ) => {
+      if (
+        payload &&
+        typeof payload.sourceId === "string" &&
+        (payload.sourceType === "screen" || payload.sourceType === "window")
+      ) {
+        // Mid-session source change: keep timeline + clipboard selection.
+        if (activeSession) {
+          activeSession = {
+            ...activeSession,
+            sourceId: payload.sourceId,
+            sourceType: payload.sourceType,
+            sourceLabel: String(payload.sourceLabel ?? "capture"),
+          };
+          return activeSession;
+        }
 
-  ipcMain.handle("session:clear", () => {
+        activeSession = {
+          id: randomUUID(),
+          sourceId: payload.sourceId,
+          sourceType: payload.sourceType,
+          sourceLabel: String(payload.sourceLabel ?? "capture"),
+          startedAt: Date.now(),
+        };
+        sessionEvents = [];
+        startClipboardWatcher();
+        return activeSession;
+      }
+
+      stopClipboardWatcher();
+      activeSession = null;
+      sessionEvents = [];
+      currentSelection = null;
+      return null;
+    },
+  );
+
+  ipcMain.handle("session:clear", async () => {
+    try {
+      const logPath = await persistSessionLog();
+      if (logPath) {
+        console.info("[coco] session log saved", logPath);
+      }
+    } catch (err) {
+      console.warn("[coco] failed to persist session log on clear", err);
+    }
+
+    stopClipboardWatcher();
     activeSession = null;
+    sessionEvents = [];
+    currentSelection = null;
+    lastClipboardText = "";
     isRecording = false;
   });
 
@@ -664,6 +928,12 @@ function registerIpc(): void {
   ipcMain.on("capture:recording-state", (_event, recording: boolean) => {
     isRecording = Boolean(recording);
   });
+
+  ipcMain.handle("notes:silent", async () => noteSilent());
+
+  ipcMain.handle("notes:get-events", () => sessionEvents);
+
+  ipcMain.handle("notes:get-selection", () => currentSelection);
 }
 
 app.whenReady().then(() => {
@@ -686,6 +956,7 @@ app.whenReady().then(() => {
 });
 
 app.on("will-quit", () => {
+  stopClipboardWatcher();
   globalShortcut.unregisterAll();
 });
 

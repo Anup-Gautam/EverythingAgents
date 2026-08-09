@@ -6,10 +6,13 @@ import {
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import { CommandBar } from "./CommandBar";
+import { classifyCommand, intentLabel, type Intent } from "./intents";
 import { orbStateLabel, type OrbState } from "./orbStates";
 import { ScreenRecorder } from "./screenRecorder";
 import type { CaptureSource, LocalSession } from "./session";
 import { SourcePicker } from "./SourcePicker";
+import { isSpeechRecognitionAvailable, listenOnce } from "./speech";
 
 type DragState = {
   offsetX: number;
@@ -19,17 +22,24 @@ type DragState = {
 };
 
 const DRAG_THRESHOLD_PX = 5;
+const LONG_PRESS_MS = 450;
 
 export function App() {
   const [orbState, setOrbState] = useState<OrbState>("idle");
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [commandOpen, setCommandOpen] = useState(false);
+  const [commandText, setCommandText] = useState("");
+  const [commandHint, setCommandHint] = useState<string | null>(null);
   const [session, setSession] = useState<LocalSession | null>(null);
   const [recording, setRecording] = useState(false);
+  const [listening, setListening] = useState(false);
   const [pressed, setPressed] = useState(false);
   const [caption, setCaption] = useState<string | null>(null);
 
   const draggingRef = useRef(false);
   const didDragRef = useRef(false);
+  const longPressRef = useRef(false);
+  const pressTimerRef = useRef<number | null>(null);
   const dragOffsetRef = useRef<DragState>({
     offsetX: 0,
     offsetY: 0,
@@ -40,7 +50,9 @@ export function App() {
   const recorderRef = useRef(new ScreenRecorder());
   const sessionRef = useRef<LocalSession | null>(null);
   const recordingRef = useRef(false);
+  const listeningRef = useRef(false);
   const togglingRef = useRef(false);
+  const pttBusyRef = useRef(false);
 
   useEffect(() => {
     sessionRef.current = session;
@@ -50,6 +62,10 @@ export function App() {
     recordingRef.current = recording;
     window.coco?.setRecordingState(recording);
   }, [recording]);
+
+  useEffect(() => {
+    listeningRef.current = listening;
+  }, [listening]);
 
   const showCaption = useCallback((text: string, ms = 1600) => {
     setCaption(text);
@@ -62,7 +78,26 @@ export function App() {
     }, ms);
   }, []);
 
+  const closeCommandBar = useCallback(async () => {
+    setCommandOpen(false);
+    setCommandHint(null);
+    await window.coco?.setLayout("compact");
+  }, []);
+
+  const openCommandBar = useCallback(
+    async (prefill = "", hint: string | null = null) => {
+      setPickerOpen(false);
+      setCommandOpen(true);
+      setCommandText(prefill);
+      setCommandHint(hint);
+      await window.coco?.setLayout("command");
+    },
+    [],
+  );
+
   const openPicker = useCallback(async () => {
+    setCommandOpen(false);
+    setCommandHint(null);
     setPickerOpen(true);
     await window.coco?.setLayout("picker");
   }, []);
@@ -154,6 +189,7 @@ export function App() {
       setSession(next);
       setOrbState("session");
       setPickerOpen(false);
+      setCommandOpen(false);
       await window.coco?.setSession({
         sourceId: next.sourceId,
         sourceType: next.sourceType,
@@ -180,6 +216,7 @@ export function App() {
     setSession(null);
     void window.coco?.clearSession();
     setPickerOpen(false);
+    setCommandOpen(false);
     void window.coco?.setLayout("compact");
     setOrbState("synthesizing");
     showCaption("Building your notes…", 2200);
@@ -188,10 +225,133 @@ export function App() {
     }, 2200);
   }, [orbState, showCaption, stopRecordingAndSave]);
 
+  const runIntent = useCallback(
+    async (intent: Intent) => {
+      switch (intent) {
+        case "start_recording":
+          await startRecording();
+          break;
+        case "stop_recording":
+          if (recordingRef.current || recorderRef.current.isRecording) {
+            await stopRecordingAndSave();
+          } else {
+            showCaption("Not recording", 1600);
+          }
+          break;
+        case "capture_screenshot":
+          await window.coco.takeScreenshot();
+          break;
+        case "note_silent":
+          await window.coco.noteSilent();
+          break;
+        case "explain":
+          showCaption("Explain — soon (later day)", 2200);
+          break;
+        case "end_session":
+          await endSession();
+          break;
+        case "unknown":
+          break;
+      }
+    },
+    [endSession, showCaption, startRecording, stopRecordingAndSave],
+  );
+
+  const handleCommandSubmit = useCallback(
+    async (raw: string) => {
+      const classified = classifyCommand(raw);
+      console.info("[coco] local intent", classified);
+
+      if (
+        classified.intent === "unknown" ||
+        (classified.confidence === "low" &&
+          classified.intent !== "stop_recording")
+      ) {
+        await openCommandBar(
+          classified.raw,
+          `Not sure what “${classified.raw || "…"}” means. Try: screenshot, note this, start recording, end session.`,
+        );
+        return;
+      }
+
+      if (
+        classified.confidence === "low" &&
+        classified.intent === "stop_recording" &&
+        !recordingRef.current
+      ) {
+        await openCommandBar(
+          classified.raw,
+          "Did you mean stop recording or end session? Type the full command.",
+        );
+        return;
+      }
+
+      await closeCommandBar();
+      showCaption(intentLabel(classified.intent), 1200);
+      await runIntent(classified.intent);
+    },
+    [closeCommandBar, openCommandBar, runIntent, showCaption],
+  );
+
+  const toggleCommandBar = useCallback(async () => {
+    if (commandOpen) {
+      await closeCommandBar();
+      return;
+    }
+    await openCommandBar("");
+  }, [closeCommandBar, commandOpen, openCommandBar]);
+
+  const runPushToTalk = useCallback(async () => {
+    if (pttBusyRef.current) return;
+    pttBusyRef.current = true;
+
+    try {
+      if (!isSpeechRecognitionAvailable()) {
+        await openCommandBar(
+          "",
+          "Speech unavailable here — type a command instead.",
+        );
+        return;
+      }
+
+      setListening(true);
+      setOrbState("listening");
+      showCaption("Listening…", 1200);
+
+      try {
+        const transcript = await listenOnce({ timeoutMs: 8000 });
+        setListening(false);
+        if (sessionRef.current || recordingRef.current) {
+          setOrbState(recordingRef.current ? "recording" : "session");
+        } else {
+          setOrbState("idle");
+        }
+        showCaption(`Heard: ${transcript}`, 1600);
+        await handleCommandSubmit(transcript);
+      } catch (err) {
+        setListening(false);
+        if (sessionRef.current || recordingRef.current) {
+          setOrbState(recordingRef.current ? "recording" : "session");
+        } else {
+          setOrbState("idle");
+        }
+        await openCommandBar(
+          "",
+          err instanceof Error ? err.message : "Try typing a command",
+        );
+      }
+    } finally {
+      pttBusyRef.current = false;
+    }
+  }, [handleCommandSubmit, openCommandBar, showCaption]);
+
   useEffect(() => {
     return () => {
       if (captionTimerRef.current !== null) {
         window.clearTimeout(captionTimerRef.current);
+      }
+      if (pressTimerRef.current !== null) {
+        window.clearTimeout(pressTimerRef.current);
       }
       recorderRef.current.cancel();
     };
@@ -199,23 +359,24 @@ export function App() {
 
   useEffect(() => {
     if (!window.coco?.onScreenshotResult) return;
-
     return window.coco.onScreenshotResult((result) => {
-      if (result.ok) {
-        showCaption(`Saved ${result.fileName}`, 2600);
-      } else {
-        showCaption(result.error, 2200);
-      }
+      if (result.ok) showCaption(`Saved ${result.fileName}`, 2600);
+      else showCaption(result.error, 2200);
     });
   }, [showCaption]);
 
   useEffect(() => {
     if (!window.coco?.onRecordingResult) return;
-
     return window.coco.onRecordingResult((result) => {
-      if (!result.ok) {
-        showCaption(result.error, 2200);
-      }
+      if (!result.ok) showCaption(result.error, 2200);
+    });
+  }, [showCaption]);
+
+  useEffect(() => {
+    if (!window.coco?.onNoteSilentResult) return;
+    return window.coco.onNoteSilentResult((result) => {
+      if (result.ok) showCaption(`Note: ${result.preview}`, 2600);
+      else showCaption(result.error, 2200);
     });
   }, [showCaption]);
 
@@ -227,8 +388,21 @@ export function App() {
   }, [toggleRecording]);
 
   useEffect(() => {
-    if (!window.coco?.onMenuAction) return;
+    if (!window.coco?.onCommandToggle) return;
+    return window.coco.onCommandToggle(() => {
+      void toggleCommandBar();
+    });
+  }, [toggleCommandBar]);
 
+  useEffect(() => {
+    if (!window.coco?.onPtt) return;
+    return window.coco.onPtt(() => {
+      void runPushToTalk();
+    });
+  }, [runPushToTalk]);
+
+  useEffect(() => {
+    if (!window.coco?.onMenuAction) return;
     return window.coco.onMenuAction((action) => {
       switch (action) {
         case "end_session":
@@ -252,6 +426,13 @@ export function App() {
     });
   }, [endSession, openPicker, showCaption]);
 
+  const clearPressTimer = () => {
+    if (pressTimerRef.current !== null) {
+      window.clearTimeout(pressTimerRef.current);
+      pressTimerRef.current = null;
+    }
+  };
+
   const onPointerDown = useCallback(
     async (event: ReactPointerEvent<HTMLButtonElement>) => {
       if (event.button !== 0 || !window.coco) return;
@@ -259,7 +440,16 @@ export function App() {
       event.currentTarget.setPointerCapture(event.pointerId);
       setPressed(true);
       didDragRef.current = false;
+      longPressRef.current = false;
       draggingRef.current = true;
+      clearPressTimer();
+
+      pressTimerRef.current = window.setTimeout(() => {
+        if (!didDragRef.current) {
+          longPressRef.current = true;
+          void openCommandBar("");
+        }
+      }, LONG_PRESS_MS);
 
       const bounds = await window.coco.getBounds();
       dragOffsetRef.current = {
@@ -269,7 +459,7 @@ export function App() {
         startY: event.screenY,
       };
     },
-    [],
+    [openCommandBar],
   );
 
   const onPointerMove = useCallback(
@@ -284,6 +474,7 @@ export function App() {
 
       if (distance >= DRAG_THRESHOLD_PX) {
         didDragRef.current = true;
+        clearPressTimer();
       }
 
       if (!didDragRef.current) return;
@@ -302,6 +493,7 @@ export function App() {
 
       draggingRef.current = false;
       setPressed(false);
+      clearPressTimer();
 
       try {
         event.currentTarget.releasePointerCapture(event.pointerId);
@@ -314,6 +506,17 @@ export function App() {
         return;
       }
 
+      // Long-press already opened the command bar.
+      if (longPressRef.current) {
+        longPressRef.current = false;
+        return;
+      }
+
+      if (commandOpen) {
+        void closeCommandBar();
+        return;
+      }
+
       if (pickerOpen) {
         void closePicker();
         return;
@@ -321,6 +524,11 @@ export function App() {
 
       if (orbState === "idle" && !session) {
         void openPicker();
+        return;
+      }
+
+      if (listening) {
+        showCaption("Listening…", 1200);
         return;
       }
 
@@ -337,7 +545,10 @@ export function App() {
       showCaption(orbStateLabel(orbState), 1200);
     },
     [
+      closeCommandBar,
       closePicker,
+      commandOpen,
+      listening,
       openPicker,
       orbState,
       pickerOpen,
@@ -357,21 +568,31 @@ export function App() {
 
   const visualState: OrbState = pickerOpen
     ? "idle"
-    : recording
-      ? "recording"
-      : orbState === "idle" && session
-        ? "session"
-        : orbState;
+    : listening
+      ? "listening"
+      : recording
+        ? "recording"
+        : orbState === "idle" && session
+          ? "session"
+          : orbState;
 
   const showCaptionBubble =
-    visualState === "synthesizing" || caption !== null;
+    !commandOpen &&
+    !pickerOpen &&
+    (visualState === "synthesizing" || caption !== null);
   const captionText =
     visualState === "synthesizing" && !caption
       ? "Building your notes…"
       : caption;
 
+  const shellClass = pickerOpen
+    ? "shell shell--picker"
+    : commandOpen
+      ? "shell shell--command"
+      : "shell";
+
   return (
-    <div className={`shell${pickerOpen ? " shell--picker" : ""}`}>
+    <div className={shellClass}>
       <div className="orb-wrap">
         <span className={`orb__ring orb__ring--${visualState}`} aria-hidden />
         <button
@@ -395,6 +616,14 @@ export function App() {
         <SourcePicker
           onSelect={startSession}
           onCancel={() => void closePicker()}
+        />
+      ) : commandOpen ? (
+        <CommandBar
+          value={commandText}
+          hint={commandHint}
+          onChange={setCommandText}
+          onSubmit={(value) => void handleCommandSubmit(value)}
+          onCancel={() => void closeCommandBar()}
         />
       ) : (
         <div

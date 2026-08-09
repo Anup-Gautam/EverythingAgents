@@ -14,7 +14,7 @@ export type MenuAction =
   | "settings"
   | "change_source";
 
-export type WindowLayout = "compact" | "picker";
+export type WindowLayout = "compact" | "picker" | "command";
 
 export type SourceType = "screen" | "window";
 
@@ -33,9 +33,20 @@ export type SourcesListResult = {
 };
 
 export type ActiveSession = {
+  id: string;
   sourceId: string;
   sourceType: SourceType;
   sourceLabel: string;
+  startedAt: number;
+};
+
+export type SessionEvent = {
+  id: string;
+  type: "note_silent" | "screenshot" | "recording";
+  timestamp: number;
+  text?: string;
+  filePath?: string;
+  fileName?: string;
 };
 
 export type ScreenshotResult =
@@ -44,6 +55,10 @@ export type ScreenshotResult =
 
 export type RecordingSaveResult =
   | { ok: true; filePath: string; fileName: string }
+  | { ok: false; error: string };
+
+export type NoteSilentResult =
+  | { ok: true; event: SessionEvent; preview: string }
   | { ok: false; error: string };
 
 const coco = {
@@ -65,7 +80,11 @@ const coco = {
     ipcRenderer.invoke("sources:open-settings"),
   revealElectronApp: (): Promise<void> =>
     ipcRenderer.invoke("sources:reveal-electron"),
-  setSession: (session: ActiveSession): Promise<ActiveSession | null> =>
+  setSession: (session: {
+    sourceId: string;
+    sourceType: SourceType;
+    sourceLabel: string;
+  }): Promise<ActiveSession | null> =>
     ipcRenderer.invoke("session:set", session),
   clearSession: (): Promise<void> => ipcRenderer.invoke("session:clear"),
   takeScreenshot: (): Promise<ScreenshotResult> =>
@@ -78,6 +97,12 @@ const coco = {
   setRecordingState: (recording: boolean): void => {
     ipcRenderer.send("capture:recording-state", recording);
   },
+  noteSilent: (): Promise<NoteSilentResult> =>
+    ipcRenderer.invoke("notes:silent"),
+  getSessionEvents: (): Promise<SessionEvent[]> =>
+    ipcRenderer.invoke("notes:get-events"),
+  getCurrentSelection: (): Promise<string | null> =>
+    ipcRenderer.invoke("notes:get-selection"),
   onMenuAction: (handler: (action: MenuAction) => void): (() => void) => {
     const listener = (_event: IpcRendererEvent, action: MenuAction) => {
       handler(action);
@@ -119,6 +144,35 @@ const coco = {
     ipcRenderer.on("capture:recording-result", listener);
     return () => {
       ipcRenderer.removeListener("capture:recording-result", listener);
+    };
+  },
+  onNoteSilentResult: (
+    handler: (result: NoteSilentResult) => void,
+  ): (() => void) => {
+    const listener = (_event: IpcRendererEvent, result: NoteSilentResult) => {
+      handler(result);
+    };
+    ipcRenderer.on("notes:silent-result", listener);
+    return () => {
+      ipcRenderer.removeListener("notes:silent-result", listener);
+    };
+  },
+  onCommandToggle: (handler: () => void): (() => void) => {
+    const listener = () => {
+      handler();
+    };
+    ipcRenderer.on("command:toggle", listener);
+    return () => {
+      ipcRenderer.removeListener("command:toggle", listener);
+    };
+  },
+  onPtt: (handler: () => void): (() => void) => {
+    const listener = () => {
+      handler();
+    };
+    ipcRenderer.on("command:ptt", listener);
+    return () => {
+      ipcRenderer.removeListener("command:ptt", listener);
     };
   },
 };

@@ -14,7 +14,7 @@ type MenuAction =
   | "settings"
   | "change_source";
 
-type WindowLayout = "compact" | "picker";
+type WindowLayout = "compact" | "picker" | "command";
 
 type SourceType = "screen" | "window";
 
@@ -33,9 +33,20 @@ type SourcesListResult = {
 };
 
 type ActiveSession = {
+  id: string;
   sourceId: string;
   sourceType: SourceType;
   sourceLabel: string;
+  startedAt: number;
+};
+
+type SessionEvent = {
+  id: string;
+  type: "note_silent" | "screenshot" | "recording";
+  timestamp: number;
+  text?: string;
+  filePath?: string;
+  fileName?: string;
 };
 
 type ScreenshotResult =
@@ -44,6 +55,10 @@ type ScreenshotResult =
 
 type RecordingSaveResult =
   | { ok: true; filePath: string; fileName: string }
+  | { ok: false; error: string };
+
+type NoteSilentResult =
+  | { ok: true; event: SessionEvent; preview: string }
   | { ok: false; error: string };
 
 interface CocoApi {
@@ -55,7 +70,11 @@ interface CocoApi {
   listSources: (sourceType: SourceType) => Promise<SourcesListResult>;
   openScreenRecordingSettings: () => Promise<void>;
   revealElectronApp: () => Promise<void>;
-  setSession: (session: ActiveSession) => Promise<ActiveSession | null>;
+  setSession: (session: {
+    sourceId: string;
+    sourceType: SourceType;
+    sourceLabel: string;
+  }) => Promise<ActiveSession | null>;
   clearSession: () => Promise<void>;
   takeScreenshot: () => Promise<ScreenshotResult>;
   saveRecording: (payload: {
@@ -63,10 +82,16 @@ interface CocoApi {
     sourceLabel: string;
   }) => Promise<RecordingSaveResult>;
   setRecordingState: (recording: boolean) => void;
+  noteSilent: () => Promise<NoteSilentResult>;
+  getSessionEvents: () => Promise<SessionEvent[]>;
+  getCurrentSelection: () => Promise<string | null>;
   onMenuAction: (handler: (action: MenuAction) => void) => () => void;
   onScreenshotResult: (handler: (result: ScreenshotResult) => void) => () => void;
   onToggleRecording: (handler: () => void) => () => void;
   onRecordingResult: (handler: (result: RecordingSaveResult) => void) => () => void;
+  onNoteSilentResult: (handler: (result: NoteSilentResult) => void) => () => void;
+  onCommandToggle: (handler: () => void) => () => void;
+  onPtt: (handler: () => void) => () => void;
 }
 
 interface Window {

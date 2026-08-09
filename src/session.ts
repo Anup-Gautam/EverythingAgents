@@ -14,3 +14,14 @@ export type LocalSession = {
   sourceLabel: string;
   startedAt: number;
 };
+
+export type SessionEventType = "note_silent" | "screenshot" | "recording";
+
+export type SessionEvent = {
+  id: string;
+  type: SessionEventType;
+  timestamp: number;
+  text?: string;
+  filePath?: string;
+  fileName?: string;
+};
