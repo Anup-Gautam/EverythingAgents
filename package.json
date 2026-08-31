@@ -15,10 +15,15 @@
     "start": "npm run dev"
   },
   "dependencies": {
+    "dotenv": "^17.4.2",
+    "firebase": "^12.17.1",
+    "marked": "^18.0.10",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "@types/dotenv": "^6.1.1",
+    "@types/marked": "^5.0.2",
     "@types/node": "^22.10.5",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",

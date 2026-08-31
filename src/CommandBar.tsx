@@ -37,7 +37,7 @@ export function CommandBar({
           className="command__input"
           type="text"
           value={value}
-          placeholder='e.g. "screenshot", "note this", "start recording"'
+          placeholder='e.g. "screenshot", "remember", "note this"'
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === "Escape") {

@@ -7,12 +7,15 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { CommandBar } from "./CommandBar";
+import { playErrorChime, playSuccessChime, speakText } from "./feedback";
+import { isFirebaseConfigured } from "./firebase";
 import { classifyCommand, intentLabel, type Intent } from "./intents";
 import { orbStateLabel, type OrbState } from "./orbStates";
 import { ScreenRecorder } from "./screenRecorder";
 import type { CaptureSource, LocalSession } from "./session";
 import { SourcePicker } from "./SourcePicker";
 import { isSpeechRecognitionAvailable, listenOnce } from "./speech";
+import { recordVoiceCommand, RememberRecorder } from "./voiceCapture";
 
 type DragState = {
   offsetX: number;
@@ -33,6 +36,7 @@ export function App() {
   const [session, setSession] = useState<LocalSession | null>(null);
   const [recording, setRecording] = useState(false);
   const [listening, setListening] = useState(false);
+  const [remembering, setRemembering] = useState(false);
   const [pressed, setPressed] = useState(false);
   const [caption, setCaption] = useState<string | null>(null);
 
@@ -50,9 +54,12 @@ export function App() {
   const recorderRef = useRef(new ScreenRecorder());
   const sessionRef = useRef<LocalSession | null>(null);
   const recordingRef = useRef(false);
-  const listeningRef = useRef(false);
   const togglingRef = useRef(false);
   const pttBusyRef = useRef(false);
+  const rememberBusyRef = useRef(false);
+  const rememberRecorderRef = useRef(new RememberRecorder());
+  const stopRememberRef = useRef<() => Promise<void>>(async () => {});
+  const rememberingRef = useRef(false);
 
   useEffect(() => {
     sessionRef.current = session;
@@ -64,8 +71,8 @@ export function App() {
   }, [recording]);
 
   useEffect(() => {
-    listeningRef.current = listening;
-  }, [listening]);
+    rememberingRef.current = remembering;
+  }, [remembering]);
 
   const showCaption = useCallback((text: string, ms = 1600) => {
     setCaption(text);
@@ -77,6 +84,39 @@ export function App() {
       captionTimerRef.current = null;
     }, ms);
   }, []);
+
+  const handleSignIn = useCallback(async () => {
+    if (!isFirebaseConfigured()) {
+      showCaption("Fill VITE_FIREBASE_* in .env, then restart", 2800);
+      return;
+    }
+    if (!window.coco?.signInWithGoogle) {
+      showCaption("Sign-in unavailable", 1800);
+      return;
+    }
+
+    showCaption("Opening browser…", 2000);
+    const result = await window.coco.signInWithGoogle();
+    if (!result.ok) {
+      if (!result.cancelled) {
+        showCaption(result.error, 3200);
+      }
+      return;
+    }
+
+    const label = result.session.email ?? result.session.uid;
+    showCaption(`Signed in as ${label}`, 2200);
+  }, [showCaption]);
+
+  const handleSignOut = useCallback(async () => {
+    try {
+      await window.coco?.signOut();
+      showCaption("Signed out", 1600);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      showCaption(message, 2800);
+    }
+  }, [showCaption]);
 
   const closeCommandBar = useCallback(async () => {
     setCommandOpen(false);
@@ -122,13 +162,16 @@ export function App() {
       });
 
       if (result.ok) {
+        void playSuccessChime();
         showCaption(`Saved ${result.fileName}`, 2600);
       } else {
+        void playErrorChime();
         showCaption(result.error, 2200);
       }
     } catch (err) {
       setRecording(false);
       setOrbState(currentSession ? "session" : "idle");
+      void playErrorChime();
       showCaption(
         err instanceof Error ? err.message : "Failed to stop recording",
         2200,
@@ -139,6 +182,7 @@ export function App() {
   const startRecording = useCallback(async () => {
     const currentSession = sessionRef.current;
     if (!currentSession) {
+      void playErrorChime();
       showCaption("Start a session first", 1800);
       return;
     }
@@ -147,10 +191,12 @@ export function App() {
       await recorderRef.current.start(currentSession.sourceId);
       setRecording(true);
       setOrbState("recording");
+      void playSuccessChime();
       showCaption("Recording…", 1400);
     } catch (err) {
       setRecording(false);
       setOrbState("session");
+      void playErrorChime();
       showCaption(
         err instanceof Error
           ? err.message
@@ -194,13 +240,146 @@ export function App() {
         sourceId: next.sourceId,
         sourceType: next.sourceType,
         sourceLabel: next.sourceLabel,
+      }).then((active) => {
+        if (active?.cloudSessionId) {
+          showCaption(`Session + cloud: ${source.name}`, 2200);
+        } else {
+          showCaption(`Session: ${source.name}`, 2200);
+        }
+        speakText("Session started");
       });
       await window.coco?.setLayout("compact");
-      showCaption(`Session: ${source.name}`, 2200);
       console.info("[coco] local session started", next);
     },
     [showCaption, stopRecordingAndSave],
   );
+
+  const stopRememberAndSave = useCallback(async () => {
+    if (rememberBusyRef.current) return;
+    if (!rememberRecorderRef.current.active && !rememberingRef.current) {
+      return;
+    }
+
+    rememberBusyRef.current = true;
+    try {
+      showCaption("Saving voice note…", 2000);
+      const clip = await rememberRecorderRef.current.stop();
+      setRemembering(false);
+      await window.coco?.setLayout("compact");
+
+      if (sessionRef.current) {
+        setOrbState("session");
+      } else {
+        setOrbState("idle");
+      }
+
+      if (!clip) {
+        void playErrorChime();
+        showCaption("Heard nothing — try Remember again", 2600);
+        return;
+      }
+
+      const auth = await window.coco?.getAuthSession();
+      if (!auth?.idToken || !window.coco?.transcribeVoice) {
+        void playErrorChime();
+        showCaption("Sign in to save spoken notes", 2600);
+        return;
+      }
+
+      showCaption("Transcribing…", 2000);
+      const transcript = await window.coco.transcribeVoice(clip);
+      if (!transcript.ok) {
+        void playErrorChime();
+        showCaption(transcript.error, 2800);
+        return;
+      }
+
+      let text = transcript.transcript.trim();
+      text = text
+        .replace(/\b(stop remembering|stop remember|that's it|thats it)\s*$/i, "")
+        .trim();
+
+      if (!text) {
+        void playErrorChime();
+        showCaption("Heard nothing useful", 2200);
+        return;
+      }
+
+      if (!window.coco?.saveNoteText) {
+        void playErrorChime();
+        showCaption("Could not save note", 2200);
+        return;
+      }
+
+      const saved = await window.coco.saveNoteText(text);
+      if (saved.ok) {
+        void playSuccessChime();
+        showCaption(`Remembered: ${saved.preview}`, 3600);
+      } else {
+        void playErrorChime();
+        showCaption(saved.error, 2800);
+      }
+    } catch (err) {
+      setRemembering(false);
+      await window.coco?.setLayout("compact");
+      if (sessionRef.current) setOrbState("session");
+      else setOrbState("idle");
+      void playErrorChime();
+      showCaption(
+        err instanceof Error ? err.message : "Could not save voice note",
+        2800,
+      );
+    } finally {
+      rememberBusyRef.current = false;
+    }
+  }, [showCaption]);
+
+  useEffect(() => {
+    stopRememberRef.current = stopRememberAndSave;
+  }, [stopRememberAndSave]);
+
+  const startRemember = useCallback(async () => {
+    if (!sessionRef.current) {
+      showCaption("Start a session first", 1800);
+      return;
+    }
+    if (rememberingRef.current || rememberRecorderRef.current.active) {
+      showCaption("Already remembering — click the mic to stop", 2600);
+      return;
+    }
+    // Don't block on PTT flags — voice "remember" runs inside PTT completion.
+    if (recordingRef.current) {
+      showCaption("Stop screen recording first", 2000);
+      return;
+    }
+
+    rememberBusyRef.current = true;
+    try {
+      setCommandOpen(false);
+      setPickerOpen(false);
+      await rememberRecorderRef.current.start({
+        maxMs: 90_000,
+        onMaxDuration: () => {
+          void stopRememberRef.current();
+        },
+      });
+      setRemembering(true);
+      setOrbState("listening");
+      await window.coco?.setLayout("remember");
+      showCaption("Remembering… click the mic to stop", 3200);
+    } catch (err) {
+      setRemembering(false);
+      await window.coco?.setLayout("compact");
+      setOrbState("session");
+      void playErrorChime();
+      showCaption(
+        err instanceof Error ? err.message : "Could not open mic",
+        2600,
+      );
+    } finally {
+      rememberBusyRef.current = false;
+    }
+  }, [showCaption]);
 
   const endSession = useCallback(async () => {
     if (!sessionRef.current && orbState === "idle") {
@@ -208,22 +387,38 @@ export function App() {
       return;
     }
 
+    if (rememberingRef.current || rememberRecorderRef.current.active) {
+      await stopRememberAndSave();
+    }
+
     if (recordingRef.current || recorderRef.current.isRecording) {
       await stopRecordingAndSave();
     }
 
-    console.info("[coco] local session ended", sessionRef.current);
-    setSession(null);
-    void window.coco?.clearSession();
+    console.info("[coco] local session ending", sessionRef.current);
     setPickerOpen(false);
     setCommandOpen(false);
     void window.coco?.setLayout("compact");
     setOrbState("synthesizing");
-    showCaption("Building your notes…", 2200);
+    showCaption("Building your notes…", 8000);
+
+    const result = await window.coco?.endSession?.();
+    setSession(null);
+
+    if (result?.ok) {
+      showCaption(`Notes ready · ${result.fileName}`, 4200);
+      void speakText("Your notes are ready");
+      console.info("[coco] notes ready", result);
+    } else {
+      void playErrorChime();
+      showCaption(result?.error || "Could not build notes", 3200);
+      void window.coco?.clearSession();
+    }
+
     window.setTimeout(() => {
       setOrbState("idle");
     }, 2200);
-  }, [orbState, showCaption, stopRecordingAndSave]);
+  }, [orbState, showCaption, stopRecordingAndSave, stopRememberAndSave]);
 
   const runIntent = useCallback(
     async (intent: Intent) => {
@@ -244,9 +439,31 @@ export function App() {
         case "note_silent":
           await window.coco.noteSilent();
           break;
-        case "explain":
-          showCaption("Explain — soon (later day)", 2200);
+        case "remember":
+          await startRemember();
           break;
+        case "explain": {
+          setOrbState("thinking");
+          showCaption("Explaining…", 1800);
+          const result = await window.coco.explain();
+          if (sessionRef.current || recordingRef.current) {
+            setOrbState(recordingRef.current ? "recording" : "session");
+          } else {
+            setOrbState("idle");
+          }
+          if (result.ok) {
+            showCaption(result.preview || result.answer, 5200);
+            speakText(result.answer);
+            console.info("[coco] explain", {
+              model: result.model,
+              answer: result.answer,
+            });
+          } else {
+            void playErrorChime();
+            showCaption(result.error, 2800);
+          }
+          break;
+        }
         case "end_session":
           await endSession();
           break;
@@ -254,7 +471,13 @@ export function App() {
           break;
       }
     },
-    [endSession, showCaption, startRecording, stopRecordingAndSave],
+    [
+      endSession,
+      showCaption,
+      startRecording,
+      startRemember,
+      stopRecordingAndSave,
+    ],
   );
 
   const handleCommandSubmit = useCallback(
@@ -269,7 +492,7 @@ export function App() {
       ) {
         await openCommandBar(
           classified.raw,
-          `Not sure what “${classified.raw || "…"}” means. Try: screenshot, note this, start recording, end session.`,
+          `Not sure what “${classified.raw || "…"}” means. Try: screenshot, note this, remember, start recording, end session.`,
         );
         return;
       }
@@ -303,43 +526,86 @@ export function App() {
 
   const runPushToTalk = useCallback(async () => {
     if (pttBusyRef.current) return;
+    if (rememberingRef.current || rememberRecorderRef.current.active) {
+      showCaption("Click the mic to finish Remember", 2200);
+      return;
+    }
     pttBusyRef.current = true;
 
+    const restoreOrb = () => {
+      if (sessionRef.current || recordingRef.current) {
+        setOrbState(recordingRef.current ? "recording" : "session");
+      } else {
+        setOrbState("idle");
+      }
+    };
+
     try {
-      if (!isSpeechRecognitionAvailable()) {
+      const auth = await window.coco?.getAuthSession();
+      setListening(true);
+      setOrbState("listening");
+      showCaption(
+        auth?.idToken ? "Listening… speak a command" : "Listening…",
+        1600,
+      );
+
+      let transcript = "";
+
+      if (auth?.idToken && window.coco?.transcribeVoice) {
+        try {
+          const clip = await recordVoiceCommand({ durationMs: 4500 });
+          showCaption("Transcribing…", 1600);
+          const result = await window.coco.transcribeVoice(clip);
+          if (!result.ok) {
+            throw new Error(result.error);
+          }
+          transcript = result.transcript;
+          console.info("[coco] voice transcript", {
+            model: result.model,
+            transcript,
+          });
+        } catch (err) {
+          setListening(false);
+          restoreOrb();
+          void playErrorChime();
+          await openCommandBar(
+            "",
+            err instanceof Error
+              ? err.message
+              : "Voice failed — type a command",
+          );
+          return;
+        }
+      } else if (isSpeechRecognitionAvailable()) {
+        try {
+          transcript = await listenOnce({ timeoutMs: 8000 });
+        } catch (err) {
+          setListening(false);
+          restoreOrb();
+          await openCommandBar(
+            "",
+            err instanceof Error
+              ? `${err.message} (sign in for better voice)`
+              : "Try typing a command",
+          );
+          return;
+        }
+      } else {
+        setListening(false);
+        restoreOrb();
         await openCommandBar(
           "",
-          "Speech unavailable here — type a command instead.",
+          "Sign in for Gemini voice commands, or type instead.",
         );
         return;
       }
 
-      setListening(true);
-      setOrbState("listening");
-      showCaption("Listening…", 1200);
-
-      try {
-        const transcript = await listenOnce({ timeoutMs: 8000 });
-        setListening(false);
-        if (sessionRef.current || recordingRef.current) {
-          setOrbState(recordingRef.current ? "recording" : "session");
-        } else {
-          setOrbState("idle");
-        }
-        showCaption(`Heard: ${transcript}`, 1600);
-        await handleCommandSubmit(transcript);
-      } catch (err) {
-        setListening(false);
-        if (sessionRef.current || recordingRef.current) {
-          setOrbState(recordingRef.current ? "recording" : "session");
-        } else {
-          setOrbState("idle");
-        }
-        await openCommandBar(
-          "",
-          err instanceof Error ? err.message : "Try typing a command",
-        );
-      }
+      setListening(false);
+      restoreOrb();
+      showCaption(`Heard: ${transcript}`, 1600);
+      // Release PTT lock before intents that need the mic (Remember).
+      pttBusyRef.current = false;
+      await handleCommandSubmit(transcript);
     } finally {
       pttBusyRef.current = false;
     }
@@ -354,29 +620,58 @@ export function App() {
         window.clearTimeout(pressTimerRef.current);
       }
       recorderRef.current.cancel();
+      void rememberRecorderRef.current.cancel();
     };
   }, []);
 
   useEffect(() => {
     if (!window.coco?.onScreenshotResult) return;
     return window.coco.onScreenshotResult((result) => {
-      if (result.ok) showCaption(`Saved ${result.fileName}`, 2600);
-      else showCaption(result.error, 2200);
+      if (!result.ok) {
+        void playErrorChime();
+        showCaption(result.error, 2200);
+        return;
+      }
+      void playSuccessChime();
+      if (result.label) {
+        showCaption(result.label, 3200);
+      } else if (result.cloudUploaded) {
+        showCaption(`Saved + uploaded ${result.fileName}`, 2800);
+      } else if (result.cloudError) {
+        showCaption(`Saved locally (cloud: ${result.cloudError})`, 3200);
+      } else {
+        showCaption(`Saved ${result.fileName}`, 2600);
+      }
     });
   }, [showCaption]);
 
   useEffect(() => {
     if (!window.coco?.onRecordingResult) return;
     return window.coco.onRecordingResult((result) => {
-      if (!result.ok) showCaption(result.error, 2200);
+      if (!result.ok) {
+        void playErrorChime();
+        showCaption(result.error, 2200);
+        return;
+      }
+      void playSuccessChime();
+      if (result.label) {
+        showCaption(result.label, 3200);
+      } else {
+        showCaption(`Recording saved · ${result.fileName}`, 2600);
+      }
     });
   }, [showCaption]);
 
   useEffect(() => {
     if (!window.coco?.onNoteSilentResult) return;
     return window.coco.onNoteSilentResult((result) => {
-      if (result.ok) showCaption(`Note: ${result.preview}`, 2600);
-      else showCaption(result.error, 2200);
+      if (result.ok) {
+        void playSuccessChime();
+        showCaption(`Note: ${result.preview}`, 2600);
+      } else {
+        void playErrorChime();
+        showCaption(result.error, 2200);
+      }
     });
   }, [showCaption]);
 
@@ -402,6 +697,17 @@ export function App() {
   }, [runPushToTalk]);
 
   useEffect(() => {
+    if (!window.coco?.onRemember) return;
+    return window.coco.onRemember(() => {
+      if (rememberingRef.current || rememberRecorderRef.current.active) {
+        void stopRememberAndSave();
+      } else {
+        void startRemember();
+      }
+    });
+  }, [startRemember, stopRememberAndSave]);
+
+  useEffect(() => {
     if (!window.coco?.onMenuAction) return;
     return window.coco.onMenuAction((action) => {
       switch (action) {
@@ -411,20 +717,17 @@ export function App() {
         case "change_source":
           void openPicker();
           break;
-        case "pause_capture":
-          showCaption("Pause capture — soon");
+        case "sign_in":
+          void handleSignIn();
           break;
-        case "open_past_sessions":
-          showCaption("Past sessions — soon");
-          break;
-        case "settings":
-          showCaption("Settings — soon");
+        case "sign_out":
+          void handleSignOut();
           break;
         default:
           break;
       }
     });
-  }, [endSession, openPicker, showCaption]);
+  }, [endSession, handleSignIn, handleSignOut, openPicker]);
 
   const clearPressTimer = () => {
     if (pressTimerRef.current !== null) {
@@ -532,6 +835,11 @@ export function App() {
         return;
       }
 
+      if (remembering) {
+        showCaption("Remembering… click the mic to stop", 2000);
+        return;
+      }
+
       if (recording) {
         showCaption("Recording… ⌘⇧R to stop", 1800);
         return;
@@ -553,6 +861,7 @@ export function App() {
       orbState,
       pickerOpen,
       recording,
+      remembering,
       session,
       showCaption,
     ],
@@ -568,13 +877,15 @@ export function App() {
 
   const visualState: OrbState = pickerOpen
     ? "idle"
-    : listening
+    : remembering
       ? "listening"
-      : recording
-        ? "recording"
-        : orbState === "idle" && session
-          ? "session"
-          : orbState;
+      : listening
+        ? "listening"
+        : recording
+          ? "recording"
+          : orbState === "idle" && session
+            ? "session"
+            : orbState;
 
   const showCaptionBubble =
     !commandOpen &&
@@ -589,7 +900,9 @@ export function App() {
     ? "shell shell--picker"
     : commandOpen
       ? "shell shell--command"
-      : "shell";
+      : remembering
+        ? "shell shell--remember"
+        : "shell";
 
   return (
     <div className={shellClass}>
@@ -609,6 +922,32 @@ export function App() {
         </button>
         {visualState === "recording" ? (
           <span className="orb__badge" aria-hidden />
+        ) : null}
+
+        {remembering ? (
+          <button
+            type="button"
+            className="remember-mic remember-mic--active"
+            aria-label="Stop remembering and save note"
+            title="Click to stop and save"
+            onClick={(event) => {
+              event.stopPropagation();
+              void stopRememberAndSave();
+            }}
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <svg
+              className="remember-mic__icon"
+              viewBox="0 0 24 24"
+              aria-hidden
+            >
+              <path
+                fill="currentColor"
+                d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2Z"
+              />
+            </svg>
+            <span className="remember-mic__pulse" aria-hidden />
+          </button>
         ) : null}
       </div>
 

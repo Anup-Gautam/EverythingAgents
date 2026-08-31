@@ -15,7 +15,7 @@ export type LocalSession = {
   startedAt: number;
 };
 
-export type SessionEventType = "note_silent" | "screenshot" | "recording";
+export type SessionEventType = "note_silent" | "screenshot" | "recording" | "qa";
 
 export type SessionEvent = {
   id: string;
@@ -24,4 +24,7 @@ export type SessionEvent = {
   text?: string;
   filePath?: string;
   fileName?: string;
+  question?: string;
+  answer?: string;
+  label?: string;
 };

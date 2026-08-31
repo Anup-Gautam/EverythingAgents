@@ -12,12 +12,41 @@ import {
   systemPreferences,
   type Rectangle,
 } from "electron";
+import dotenv from "dotenv";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import {
+  readFirebaseConfigFromEnv,
+  startGoogleSystemBrowserLogin,
+} from "./authLogin";
+import {
+  ensureFreshAuthSession,
+  loadAuthSession,
+  refreshAuthSession,
+  saveAuthSession,
+  withTokenExpiry,
+  type AuthSession,
+} from "./authSession";
+import {
+  apiCaption,
+  apiEndSession,
+  apiExplain,
+  apiSpeak,
+  apiStartSession,
+  apiSynthesize,
+  apiTranscribe,
+  apiUploadScreenshot,
+  apiUploadTextEvent,
+} from "./cloudApi";
+import { openNotesPackWindow, writeNotesHtml } from "./notesPack";
+
+dotenv.config({ path: path.join(__dirname, "..", ".env") });
 
 const COMPACT_WIDTH = 128;
 const COMPACT_HEIGHT = 150;
+const REMEMBER_WIDTH = 128;
+const REMEMBER_HEIGHT = 210;
 const PICKER_WIDTH = 360;
 const PICKER_HEIGHT = 440;
 const COMMAND_WIDTH = 320;
@@ -29,18 +58,18 @@ const ANIM_FPS = 60;
 const SCREENSHOT_HOTKEY = "CommandOrControl+Shift+S";
 const RECORDING_HOTKEY = "CommandOrControl+Shift+R";
 const NOTE_HOTKEY = "CommandOrControl+Shift+N";
+const REMEMBER_HOTKEY = "CommandOrControl+Shift+M";
 const COMMAND_HOTKEY = "CommandOrControl+Shift+C";
 const PTT_HOTKEY = "CommandOrControl+Shift+Space";
 const CLIPBOARD_POLL_MS = 300;
 
 type MenuAction =
   | "end_session"
-  | "pause_capture"
-  | "open_past_sessions"
-  | "settings"
-  | "change_source";
+  | "change_source"
+  | "sign_in"
+  | "sign_out";
 
-type WindowLayout = "compact" | "picker" | "command";
+type WindowLayout = "compact" | "picker" | "command" | "remember";
 type SourceType = "screen" | "window";
 type ScreenAccess = ReturnType<typeof systemPreferences.getMediaAccessStatus>;
 
@@ -64,9 +93,10 @@ type ActiveSession = {
   sourceType: SourceType;
   sourceLabel: string;
   startedAt: number;
+  cloudSessionId?: string | null;
 };
 
-type SessionEventType = "note_silent" | "screenshot" | "recording";
+type SessionEventType = "note_silent" | "screenshot" | "recording" | "qa";
 
 type SessionEvent = {
   id: string;
@@ -75,18 +105,56 @@ type SessionEvent = {
   text?: string;
   filePath?: string;
   fileName?: string;
+  question?: string;
+  answer?: string;
+  label?: string;
 };
 
 type ScreenshotResult =
-  | { ok: true; filePath: string; fileName: string }
+  | {
+      ok: true;
+      filePath: string;
+      fileName: string;
+      cloudUploaded?: boolean;
+      cloudError?: string;
+      label?: string;
+    }
   | { ok: false; error: string };
 
 type RecordingSaveResult =
-  | { ok: true; filePath: string; fileName: string }
+  | { ok: true; filePath: string; fileName: string; label?: string }
   | { ok: false; error: string };
 
 type NoteSilentResult =
   | { ok: true; event: SessionEvent; preview: string }
+  | { ok: false; error: string };
+
+type ExplainResult =
+  | { ok: true; answer: string; preview: string; model: string }
+  | { ok: false; error: string };
+
+type EndSessionResult =
+  | {
+      ok: true;
+      filePath: string;
+      fileName: string;
+      model: string | null;
+      eventCount: number;
+    }
+  | { ok: false; error: string };
+
+type TranscribeResult =
+  | { ok: true; transcript: string; model: string }
+  | { ok: false; error: string };
+
+type SpeakResult =
+  | {
+      ok: true;
+      audioBase64: string;
+      mimeType: string;
+      model: string;
+      provider?: string;
+    }
   | { ok: false; error: string };
 
 let orbWindow: BrowserWindow | null = null;
@@ -98,6 +166,47 @@ let sessionEvents: SessionEvent[] = [];
 let currentSelection: string | null = null;
 let lastClipboardText = "";
 let clipboardTimer: ReturnType<typeof setInterval> | null = null;
+let authSession: AuthSession | null = null;
+
+function authEmail(): string | null {
+  return authSession?.email?.trim() || authSession?.uid || null;
+}
+
+/**
+ * Return a valid Firebase ID token, refreshing when near expiry.
+ * Clears the saved session if refresh fails.
+ */
+async function getValidIdToken(): Promise<string | null> {
+  if (!authSession?.idToken) return null;
+
+  const apiKey = readFirebaseConfigFromEnv()?.apiKey;
+  if (!apiKey) {
+    console.warn("[coco] cannot refresh auth — missing VITE_FIREBASE_API_KEY");
+    return authSession.idToken;
+  }
+
+  try {
+    const fresh = await ensureFreshAuthSession(authSession, apiKey);
+    if (
+      fresh.idToken !== authSession.idToken ||
+      fresh.refreshToken !== authSession.refreshToken ||
+      fresh.expiresAt !== authSession.expiresAt
+    ) {
+      authSession = fresh;
+      await saveAuthSession(authSession);
+      console.info("[coco] Firebase ID token refreshed");
+    } else {
+      authSession = fresh;
+    }
+    return authSession.idToken;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn("[coco] Firebase token refresh failed", message);
+    authSession = null;
+    await saveAuthSession(null);
+    return null;
+  }
+}
 
 /** Keep the orb above fullscreen apps and across all macOS Spaces. */
 function applyOverlayBehavior(win: BrowserWindow): void {
@@ -120,6 +229,9 @@ function layoutSize(layout: WindowLayout): { width: number; height: number } {
   }
   if (layout === "command") {
     return { width: COMMAND_WIDTH, height: COMMAND_HEIGHT };
+  }
+  if (layout === "remember") {
+    return { width: REMEMBER_WIDTH, height: REMEMBER_HEIGHT };
   }
   return { width: COMPACT_WIDTH, height: COMPACT_HEIGHT };
 }
@@ -346,6 +458,14 @@ function showOrbContextMenu(): void {
       },
     },
     {
+      label: "Remember",
+      accelerator: "CommandOrControl+Shift+M",
+      enabled: Boolean(activeSession),
+      click: () => {
+        orbWindow?.webContents.send("command:remember");
+      },
+    },
+    {
       label: "Command…",
       accelerator: "CommandOrControl+Shift+C",
       click: () => {
@@ -367,19 +487,16 @@ function showOrbContextMenu(): void {
       label: "Change source",
       click: () => sendMenuAction("change_source"),
     },
-    {
-      label: "Pause capture",
-      click: () => sendMenuAction("pause_capture"),
-    },
     { type: "separator" },
-    {
-      label: "Open past sessions",
-      click: () => sendMenuAction("open_past_sessions"),
-    },
-    {
-      label: "Settings",
-      click: () => sendMenuAction("settings"),
-    },
+    authEmail()
+      ? {
+          label: `Sign out (${authEmail()})`,
+          click: () => sendMenuAction("sign_out"),
+        }
+      : {
+          label: "Sign in with Google",
+          click: () => sendMenuAction("sign_in"),
+        },
     { type: "separator" },
     {
       label: "Quit",
@@ -402,6 +519,280 @@ function sessionsDir(): string {
   return path.join(app.getPath("pictures"), "Coco", "sessions");
 }
 
+function notesDir(): string {
+  return path.join(app.getPath("pictures"), "Coco", "notes");
+}
+
+function nearbyContextBlurb(
+  events: SessionEvent[],
+  around: SessionEvent,
+  radius = 2,
+): string {
+  const sorted = events.slice().sort((a, b) => a.timestamp - b.timestamp);
+  const idx = sorted.findIndex((e) => e.id === around.id);
+  if (idx < 0) return "";
+  const neighbors = sorted
+    .slice(Math.max(0, idx - radius), Math.min(sorted.length, idx + radius + 1))
+    .filter((e) => e.id !== around.id);
+  const bits: string[] = [];
+  for (const n of neighbors) {
+    if (n.label) bits.push(n.label);
+    else if (n.type === "note_silent" && n.text) {
+      bits.push(`note “${previewText(n.text, 60)}”`);
+    } else if (n.type === "qa" && n.question) {
+      bits.push(`Q&A about “${previewText(n.question, 50)}”`);
+    } else if (n.fileName) {
+      bits.push(`${n.type} (${n.fileName})`);
+    } else {
+      bits.push(n.type);
+    }
+  }
+  return bits.slice(0, 4).join("; ");
+}
+
+function firstSentences(text: string, maxChars = 220): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (!compact) return "";
+  const parts = compact.split(/(?<=[.!?])\s+/);
+  let out = parts[0] || compact;
+  if (out.length < 80 && parts[1]) {
+    out = `${out} ${parts[1]}`;
+  }
+  if (out.length <= maxChars) return out;
+  return `${out.slice(0, maxChars - 1).trim()}…`;
+}
+
+function inferSessionTitle(events: SessionEvent[], sourceLabel: string): string {
+  const labels = events
+    .map((e) => e.label?.trim())
+    .filter((s): s is string => Boolean(s));
+  if (labels[0]) return previewText(labels[0], 72);
+  const quote = events.find((e) => e.type === "note_silent" && e.text)?.text;
+  if (quote) return previewText(firstSentences(quote, 80), 72);
+  return sourceLabel || "Session study note";
+}
+
+function inferBigIdea(events: SessionEvent[]): string {
+  const sorted = events.slice().sort((a, b) => a.timestamp - b.timestamp);
+  const quotes = sorted
+    .filter((e) => e.type === "note_silent" && e.text)
+    .map((e) => String(e.text).trim())
+    .sort((a, b) => b.length - a.length);
+  if (quotes[0]) {
+    return firstSentences(quotes[0], 240);
+  }
+
+  const qa = sorted.find((e) => e.type === "qa" && e.answer);
+  if (qa?.answer) {
+    return firstSentences(qa.answer, 240);
+  }
+
+  const labeled = sorted.find((e) => e.label);
+  if (labeled?.label) {
+    return `This session focused on: ${labeled.label}.`;
+  }
+
+  return "This session had captures, but not enough text yet to state a crisp takeaway — save a quote or run Explain next time.";
+}
+
+function buildSelfCheckFromSession(events: SessionEvent[]): string[] {
+  const lines: string[] = [];
+  const sorted = events.slice().sort((a, b) => a.timestamp - b.timestamp);
+  const qa = sorted.filter((e) => e.type === "qa" && (e.question || e.answer));
+
+  for (const e of qa.slice(0, 3)) {
+    if (e.question) lines.push(`**Q:** ${e.question}`);
+    if (e.answer) lines.push(`**A:** ${e.answer}`, ``);
+  }
+  if (lines.length > 0) return lines;
+
+  const quotes = sorted
+    .filter((e) => e.type === "note_silent" && e.text)
+    .map((e) => String(e.text).trim())
+    .sort((a, b) => b.length - a.length);
+
+  if (quotes[0]) {
+    const claim = firstSentences(quotes[0], 180);
+    lines.push(`**Q:** What key claim or goal did you save from this session?`);
+    lines.push(`**A:** ${claim}`, ``);
+
+    const lower = quotes[0].toLowerCase();
+    if (/case[- ]control|study|experiment|survey|method/.test(lower)) {
+      const methodHit = quotes[0].match(
+        /\b(case[- ]control study|randomized|survey|experiment|interview|analysis)[^.?!]{0,80}/i,
+      );
+      lines.push(`**Q:** What method or study design showed up in your notes?`);
+      lines.push(
+        `**A:** ${methodHit ? methodHit[0].trim() : firstSentences(quotes[0], 140)}`,
+        ``,
+      );
+    } else {
+      const second = quotes[1] ? firstSentences(quotes[1], 160) : null;
+      lines.push(`**Q:** Why did this passage matter in context of the session?`);
+      lines.push(
+        `**A:** ${
+          second ||
+          "It was the passage you chose to capture — likely the core idea you wanted to keep."
+        }`,
+        ``,
+      );
+    }
+  }
+
+  const label = sorted.find((e) => e.label)?.label;
+  if (label && lines.length < 4) {
+    lines.push(`**Q:** What did your screenshot/recording show?`);
+    lines.push(`**A:** ${label}`, ``);
+  }
+
+  if (lines.length === 0) {
+    lines.push(`**Q:** What will you capture next to make this note teachable?`);
+    lines.push(
+      `**A:** A verbatim quote of the main claim, plus one Explain on a hard sentence.`,
+      ``,
+    );
+  }
+
+  return lines;
+}
+
+function buildFallbackMarkdown(
+  session: ActiveSession,
+  events: SessionEvent[],
+): string {
+  const sorted = events.slice().sort((a, b) => a.timestamp - b.timestamp);
+  const quotes = sorted.filter((e) => e.type === "note_silent" && e.text);
+  const captures = sorted.filter(
+    (e) => e.type === "screenshot" || e.type === "recording",
+  );
+  const title = inferSessionTitle(sorted, session.sourceLabel);
+  const bigIdea = inferBigIdea(sorted);
+  const tags = [
+    ...new Set(
+      [
+        ...captures.map((c) => c.label).filter(Boolean),
+        quotes.length ? "Quotes" : null,
+        "Session review",
+      ].filter((t): t is string => Boolean(t)),
+    ),
+  ]
+    .slice(0, 5)
+    .map((t) => previewText(t, 28));
+
+  const overviewBits: string[] = [];
+  overviewBits.push(
+    `You captured ${events.length} item(s) while working with ${session.sourceLabel}.`,
+  );
+  if (quotes[0]?.text) {
+    overviewBits.push(
+      `A central passage you saved: “${previewText(String(quotes[0].text), 160)}”`,
+    );
+  }
+  if (captures[0]?.label) {
+    overviewBits.push(`Visual focus included: ${captures[0].label}.`);
+  }
+  overviewBits.push(
+    `This note was built locally from your timeline when cloud synthesis was unavailable.`,
+  );
+
+  const lines: string[] = [
+    `# ${title}`,
+    ``,
+    `Tags: ${tags.join(" | ") || "Session review"}`,
+    ``,
+    `## Overview`,
+    overviewBits.join(" "),
+    ``,
+    `> **Big idea:** ${bigIdea}`,
+    ``,
+    `## Key terms`,
+  ];
+
+  const termCandidates = new Set<string>();
+  for (const q of quotes) {
+    const text = String(q.text);
+    for (const m of text.matchAll(
+      /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}|case-control|RMS|validity)\b/g,
+    )) {
+      if (m[1].length > 3) termCandidates.add(m[1]);
+    }
+  }
+  const terms = [...termCandidates].slice(0, 6);
+  if (terms.length === 0) {
+    lines.push(`_(No clear key terms extracted offline.)_`, ``);
+  } else {
+    for (const term of terms) {
+      lines.push(`- **${term}** — mentioned in your saved session text.`);
+    }
+    lines.push(``);
+  }
+
+  lines.push(`## What you covered`);
+  if (sorted.length === 0) {
+    lines.push(`1. **Empty session** — no captures were recorded.`);
+  } else {
+    let i = 1;
+    for (const e of sorted) {
+      if (e.type === "note_silent" && e.text) {
+        lines.push(
+          `${i}. **Saved quote** — ${previewText(String(e.text), 120)}`,
+        );
+        i += 1;
+      } else if (e.type === "qa" && e.question) {
+        lines.push(`${i}. **Explained** — ${previewText(e.question, 100)}`);
+        i += 1;
+      } else if (e.type === "screenshot" || e.type === "recording") {
+        lines.push(
+          `${i}. **${e.label || e.type}** — review this ${e.type} from the session.`,
+        );
+        i += 1;
+      }
+    }
+  }
+
+  lines.push(``, `## Quotes & context`, ``);
+  if (quotes.length === 0) {
+    lines.push(`_(No quotes captured.)_`, ``);
+  } else {
+    for (const e of quotes) {
+      lines.push(`> ${String(e.text).replace(/\n/g, "\n> ")}`, ``);
+      const ctx = nearbyContextBlurb(events, e);
+      lines.push(
+        `**Context:** ${ctx || "This was a passage you chose to keep from the session."}`,
+        ``,
+      );
+    }
+  }
+
+  lines.push(`## Self-check`, ``);
+  lines.push(...buildSelfCheckFromSession(sorted));
+
+  if (captures.length > 0) {
+    lines.push(`## Captures to review`, ``);
+    for (const e of captures) {
+      lines.push(`- ${e.label || e.type}`);
+    }
+    lines.push(``);
+  }
+
+  return lines.join("\n");
+}
+
+function recentContextForCaption(limit = 8): string {
+  return sessionEvents
+    .slice(-limit)
+    .map((e) => {
+      const bits = [`[${e.type}]`];
+      if (e.label) bits.push(e.label);
+      if (e.text) bits.push(e.text.slice(0, 240));
+      if (e.question) bits.push(`Q:${e.question}`);
+      if (e.answer) bits.push(`A:${e.answer.slice(0, 240)}`);
+      if (e.fileName) bits.push(e.fileName);
+      return bits.join(" ");
+    })
+    .join("\n");
+}
+
 function previewText(text: string, max = 42): string {
   const compact = text.replace(/\s+/g, " ").trim();
   if (compact.length <= max) return compact;
@@ -421,6 +812,9 @@ function appendSessionEvent(
     text: event.text,
     filePath: event.filePath,
     fileName: event.fileName,
+    question: event.question,
+    answer: event.answer,
+    label: event.label,
   };
   sessionEvents.push(full);
   return full;
@@ -493,6 +887,34 @@ async function noteSilent(): Promise<NoteSilentResult> {
     return result;
   }
 
+  return saveNoteText(text, { emit: true });
+}
+
+async function saveNoteText(
+  rawText: string,
+  options?: { emit?: boolean },
+): Promise<NoteSilentResult> {
+  const shouldEmit = options?.emit === true;
+
+  if (!activeSession) {
+    const result: NoteSilentResult = {
+      ok: false,
+      error: "Start a session first",
+    };
+    if (shouldEmit) emitNoteResult(result);
+    return result;
+  }
+
+  const text = rawText.trim();
+  if (!text) {
+    const result: NoteSilentResult = {
+      ok: false,
+      error: "Nothing to save as a note",
+    };
+    if (shouldEmit) emitNoteResult(result);
+    return result;
+  }
+
   const event = appendSessionEvent({
     type: "note_silent",
     text,
@@ -504,18 +926,346 @@ async function noteSilent(): Promise<NoteSilentResult> {
     console.warn("[coco] failed to persist session log", err);
   }
 
+  if (activeSession.cloudSessionId) {
+    void getValidIdToken().then((token) => {
+      if (!token) return;
+      void apiUploadTextEvent({
+        idToken: token,
+        cloudSessionId: activeSession!.cloudSessionId!,
+        type: "note_silent",
+        text,
+        timestamp: event.timestamp,
+      }).then((uploaded) => {
+        if (uploaded.ok) {
+          console.info("[coco] note uploaded", uploaded.eventId);
+        } else {
+          console.warn("[coco] note upload failed", uploaded.error);
+        }
+      });
+    });
+  }
+
   const result: NoteSilentResult = {
     ok: true,
     event,
     preview: previewText(text),
   };
-  emitNoteResult(result);
+  if (shouldEmit) emitNoteResult(result);
   console.info("[coco] note_silent saved", {
     eventId: event.id,
     preview: result.preview,
     totalEvents: sessionEvents.length,
   });
   return result;
+}
+
+async function explainSelection(): Promise<ExplainResult> {
+  const text =
+    currentSelection?.trim() || clipboard.readText().trim() || "";
+  if (!text) {
+    return {
+      ok: false,
+      error: "Copy text first, then ask Explain",
+    };
+  }
+
+  if (!authSession?.idToken) {
+    return {
+      ok: false,
+      error: "Sign in to use Explain",
+    };
+  }
+
+  const idToken = await getValidIdToken();
+  if (!idToken) {
+    return {
+      ok: false,
+      error: "Sign in again — your session expired",
+    };
+  }
+
+  let explained = await apiExplain({
+    idToken,
+    text,
+    question: "What does this mean?",
+  });
+
+  if (
+    !explained.ok &&
+    /invalid or expired|unauth|id token/i.test(explained.error || "")
+  ) {
+    // Force refresh once even if skew said the token was fine.
+    try {
+      const apiKey = readFirebaseConfigFromEnv()?.apiKey;
+      if (apiKey && authSession?.refreshToken) {
+        authSession = await refreshAuthSession(authSession, apiKey);
+        await saveAuthSession(authSession);
+        explained = await apiExplain({
+          idToken: authSession.idToken,
+          text,
+          question: "What does this mean?",
+        });
+      }
+    } catch (err) {
+      console.warn("[coco] explain forced refresh failed", err);
+    }
+    if (!explained.ok) {
+      authSession = null;
+      await saveAuthSession(null);
+      return {
+        ok: false,
+        error: "Sign in again — your session expired",
+      };
+    }
+  }
+
+  if (!explained.ok) {
+    return { ok: false, error: explained.error };
+  }
+
+  if (activeSession) {
+    const event = appendSessionEvent({
+      type: "qa",
+      text,
+      question: "What does this mean?",
+      answer: explained.answer,
+    });
+    try {
+      await persistSessionLog();
+    } catch (err) {
+      console.warn("[coco] failed to persist qa event", err);
+    }
+
+    const uploadToken = await getValidIdToken();
+    if (activeSession.cloudSessionId && uploadToken) {
+      void apiUploadTextEvent({
+        idToken: uploadToken,
+        cloudSessionId: activeSession.cloudSessionId,
+        type: "qa",
+        text,
+        question: "What does this mean?",
+        answer: explained.answer,
+        timestamp: event.timestamp,
+      }).then((uploaded) => {
+        if (uploaded.ok) {
+          console.info("[coco] qa uploaded", uploaded.eventId);
+        } else {
+          console.warn("[coco] qa upload failed", uploaded.error);
+        }
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    answer: explained.answer,
+    preview: previewText(explained.answer, 160),
+    model: explained.model,
+  };
+}
+
+async function endSessionAndSynthesize(): Promise<EndSessionResult> {
+  if (!activeSession) {
+    return { ok: false, error: "No active session" };
+  }
+
+  const sessionSnapshot = { ...activeSession };
+  const eventsSnapshot = [...sessionEvents];
+
+  try {
+    await persistSessionLog();
+  } catch (err) {
+    console.warn("[coco] failed to persist session log before synthesize", err);
+  }
+
+  let markdown = "";
+  let model: string | null = null;
+
+  if (eventsSnapshot.length === 0) {
+    markdown = [
+      `# ${sessionSnapshot.sourceLabel || "Session study note"}`,
+      ``,
+      `Tags: Empty session`,
+      ``,
+      `## Overview`,
+      `No captures were recorded in this session.`,
+      ``,
+      `> **Big idea:** Start a session, capture a screenshot or quote, then end to build a study note.`,
+      ``,
+      `## Key terms`,
+      `_(No key terms captured.)_`,
+      ``,
+      `## What you covered`,
+      `1. **Empty session** — nothing to review yet.`,
+      ``,
+      `## Quotes & context`,
+      `_(No quotes captured.)_`,
+      ``,
+      `## Self-check`,
+      `**Q:** What will you capture next time?`,
+      `**A:** One screenshot, one quote, or one question worth explaining.`,
+      ``,
+    ].join("\n");
+  } else {
+    const synthToken = await getValidIdToken();
+    if (synthToken) {
+      const synth = await apiSynthesize({
+        idToken: synthToken,
+        cloudSessionId: sessionSnapshot.cloudSessionId,
+        sourceLabel: sessionSnapshot.sourceLabel,
+        startedAt: sessionSnapshot.startedAt,
+        events: eventsSnapshot.map((e) => ({
+          type: e.type,
+          timestamp: e.timestamp,
+          text: e.text,
+          fileName: e.fileName,
+          question: e.question,
+          answer: e.answer,
+          label: e.label,
+        })),
+      });
+      if (synth.ok) {
+        markdown = synth.markdown;
+        model = synth.model;
+      } else {
+        console.warn("[coco] synthesize API failed, using fallback", synth.error);
+        markdown = buildFallbackMarkdown(sessionSnapshot, eventsSnapshot);
+        markdown += `\n\n---\n_Local fallback (synthesize failed: ${synth.error})_\n`;
+      }
+    } else {
+      markdown = buildFallbackMarkdown(sessionSnapshot, eventsSnapshot);
+      markdown += `\n\n---\n_Sign in next time for Gemini-written notes._\n`;
+    }
+  }
+
+  if (sessionSnapshot.cloudSessionId) {
+    void getValidIdToken().then((token) => {
+      if (!token) return;
+      void apiEndSession({
+        idToken: token,
+        cloudSessionId: sessionSnapshot.cloudSessionId!,
+      }).then((ended) => {
+        if (ended.ok) {
+          console.info("[coco] cloud session ended", sessionSnapshot.cloudSessionId);
+        } else {
+          console.warn("[coco] cloud session end failed", ended.error);
+        }
+      });
+    });
+  }
+
+  const dir = notesDir();
+  await fs.mkdir(dir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const safeLabel = sessionSnapshot.sourceLabel
+    .replace(/[^\w\-]+/g, "_")
+    .slice(0, 40);
+  const baseName = `${stamp}_${safeLabel || "session"}`;
+  const htmlFileName = `${baseName}.html`;
+  const htmlPath = path.join(dir, htmlFileName);
+
+  const pack = await writeNotesHtml({
+    htmlPath,
+    markdown,
+    title: `Coco notes · ${sessionSnapshot.sourceLabel}`,
+    sourceLabel: sessionSnapshot.sourceLabel,
+    startedAt: sessionSnapshot.startedAt,
+    downloadName: htmlFileName,
+    media: eventsSnapshot
+      .filter((e) => e.type === "screenshot" || e.type === "recording")
+      .map((e) => ({
+        type: e.type as "screenshot" | "recording",
+        label: e.label,
+        fileName: e.fileName,
+        filePath: e.filePath,
+        timestamp: e.timestamp,
+      })),
+  });
+
+  if (!pack.htmlPath.toLowerCase().endsWith(".html")) {
+    console.warn("[coco] unexpected notes path (expected .html)", pack.htmlPath);
+  }
+
+  const filePath = pack.htmlPath;
+  const fileName = htmlFileName;
+
+  try {
+    openNotesPackWindow(pack.htmlPath);
+  } catch (err) {
+    console.warn("[coco] notes window failed; opening path", err);
+    try {
+      await shell.openPath(pack.htmlPath);
+    } catch (err2) {
+      console.warn("[coco] could not open notes html", err2);
+    }
+  }
+
+  stopClipboardWatcher();
+  activeSession = null;
+  sessionEvents = [];
+  currentSelection = null;
+  lastClipboardText = "";
+  isRecording = false;
+
+  console.info("[coco] notes ready", {
+    filePath,
+    mediaCount: pack.mediaCount,
+    model,
+    events: eventsSnapshot.length,
+  });
+  return {
+    ok: true,
+    filePath,
+    fileName,
+    model,
+    eventCount: eventsSnapshot.length,
+  };
+}
+
+async function transcribeVoice(payload: {
+  audioBase64: string;
+  mimeType: string;
+}): Promise<TranscribeResult> {
+  if (!authSession?.idToken) {
+    return { ok: false, error: "Sign in to use voice commands" };
+  }
+  const idToken = await getValidIdToken();
+  if (!idToken) {
+    return { ok: false, error: "Sign in again — your session expired" };
+  }
+  const audioBase64 = String(payload.audioBase64 ?? "").trim();
+  if (!audioBase64) {
+    return { ok: false, error: "No audio captured" };
+  }
+  const mimeType = String(payload.mimeType ?? "audio/webm").trim() || "audio/webm";
+  const result = await apiTranscribe({
+    idToken,
+    audioBase64,
+    mimeType,
+  });
+  if (!result.ok) {
+    return { ok: false, error: result.error };
+  }
+  return {
+    ok: true,
+    transcript: result.transcript,
+    model: result.model,
+  };
+}
+
+async function speakCloud(text: string): Promise<SpeakResult> {
+  if (!authSession?.idToken) {
+    return { ok: false, error: "Sign in to use spoken replies" };
+  }
+  const idToken = await getValidIdToken();
+  if (!idToken) {
+    return { ok: false, error: "Sign in again — your session expired" };
+  }
+  const clean = text.replace(/\s+/g, " ").trim();
+  if (!clean) {
+    return { ok: false, error: "No text to speak" };
+  }
+  return apiSpeak({ idToken, text: clean });
 }
 
 function requestToggleRecording(): void {
@@ -586,9 +1336,8 @@ async function captureScreenshot(): Promise<ScreenshotResult> {
     const filePath = path.join(dir, fileName);
 
     await fs.writeFile(filePath, source.thumbnail.toPNG());
-    shell.showItemInFolder(filePath);
 
-    appendSessionEvent({
+    const event = appendSessionEvent({
       type: "screenshot",
       filePath,
       fileName,
@@ -597,9 +1346,71 @@ async function captureScreenshot(): Promise<ScreenshotResult> {
       console.warn("[coco] failed to persist session log", err);
     });
 
-    const result: ScreenshotResult = { ok: true, filePath, fileName };
+    let cloudUploaded = false;
+    let cloudError: string | undefined;
+    const cloudSessionId = activeSession.cloudSessionId;
+    const token = await getValidIdToken();
+    const png = await fs.readFile(filePath);
+    const imageBase64 = png.toString("base64");
+
+    if (token) {
+      try {
+        const captioned = await apiCaption({
+          idToken: token,
+          kind: "screenshot",
+          imageBase64,
+          mimeType: "image/png",
+          sourceLabel: activeSession.sourceLabel,
+          hint: recentContextForCaption(),
+        });
+        if (captioned.ok) {
+          event.label = captioned.label;
+          void persistSessionLog().catch(() => undefined);
+          console.info("[coco] screenshot labeled", captioned.label);
+        } else {
+          console.warn("[coco] screenshot caption failed", captioned.error);
+        }
+      } catch (err) {
+        console.warn("[coco] screenshot caption error", err);
+      }
+    }
+
+    if (cloudSessionId && token) {
+      try {
+        const uploaded = await apiUploadScreenshot({
+          idToken: token,
+          cloudSessionId,
+          fileName,
+          imageBase64,
+        });
+        if (uploaded.ok) {
+          cloudUploaded = true;
+          console.info("[coco] screenshot uploaded", uploaded.storagePath);
+        } else {
+          cloudError = uploaded.error;
+          console.warn("[coco] screenshot upload failed", uploaded.error);
+        }
+      } catch (err) {
+        cloudError = err instanceof Error ? err.message : String(err);
+        console.warn("[coco] screenshot upload error", cloudError);
+      }
+    }
+
+    const result: ScreenshotResult = {
+      ok: true,
+      filePath,
+      fileName,
+      cloudUploaded,
+      cloudError,
+      label: event.label,
+    };
     emitScreenshotResult(result);
-    console.info("[coco] screenshot saved", result);
+    console.info("[coco] screenshot saved", {
+      fileName,
+      label: event.label,
+      cloudUploaded,
+      cloudError,
+    });
     return result;
   } catch (err) {
     const result: ScreenshotResult = {
@@ -633,6 +1444,13 @@ function registerCaptureHotkeys(): void {
     console.warn(`[coco] failed to register hotkey ${NOTE_HOTKEY}`);
   }
 
+  const rememberOk = globalShortcut.register(REMEMBER_HOTKEY, () => {
+    orbWindow?.webContents.send("command:remember");
+  });
+  if (!rememberOk) {
+    console.warn(`[coco] failed to register hotkey ${REMEMBER_HOTKEY}`);
+  }
+
   const cmdOk = globalShortcut.register(COMMAND_HOTKEY, () => {
     orbWindow?.webContents.send("command:toggle");
   });
@@ -664,10 +1482,9 @@ async function saveRecording(payload: {
     const filePath = path.join(dir, fileName);
 
     await fs.writeFile(filePath, Buffer.from(payload.bytes));
-    shell.showItemInFolder(filePath);
 
     if (activeSession) {
-      appendSessionEvent({
+      const event = appendSessionEvent({
         type: "recording",
         filePath,
         fileName,
@@ -675,6 +1492,37 @@ async function saveRecording(payload: {
       void persistSessionLog().catch((err) => {
         console.warn("[coco] failed to persist session log", err);
       });
+
+      const captionToken = await getValidIdToken();
+      if (captionToken) {
+        try {
+          const captioned = await apiCaption({
+            idToken: captionToken,
+            kind: "recording",
+            fileName,
+            sourceLabel: activeSession.sourceLabel,
+            recentContext: recentContextForCaption(),
+          });
+          if (captioned.ok) {
+            event.label = captioned.label;
+            void persistSessionLog().catch(() => undefined);
+            console.info("[coco] recording labeled", captioned.label);
+          } else {
+            console.warn("[coco] recording caption failed", captioned.error);
+          }
+        } catch (err) {
+          console.warn("[coco] recording caption error", err);
+        }
+      }
+
+      const result: RecordingSaveResult = {
+        ok: true,
+        filePath,
+        fileName,
+        label: event.label,
+      };
+      console.info("[coco] recording saved", result);
+      return result;
     }
 
     const result: RecordingSaveResult = { ok: true, filePath, fileName };
@@ -820,7 +1668,8 @@ function registerIpc(): void {
     if (
       layout !== "compact" &&
       layout !== "picker" &&
-      layout !== "command"
+      layout !== "command" &&
+      layout !== "remember"
     ) {
       return currentLayout;
     }
@@ -852,7 +1701,7 @@ function registerIpc(): void {
 
   ipcMain.handle(
     "session:set",
-    (
+    async (
       _event,
       payload: {
         sourceId: string;
@@ -865,7 +1714,7 @@ function registerIpc(): void {
         typeof payload.sourceId === "string" &&
         (payload.sourceType === "screen" || payload.sourceType === "window")
       ) {
-        // Mid-session source change: keep timeline + clipboard selection.
+        // Mid-session source change: keep timeline + clipboard selection + cloud session.
         if (activeSession) {
           activeSession = {
             ...activeSession,
@@ -882,9 +1731,27 @@ function registerIpc(): void {
           sourceType: payload.sourceType,
           sourceLabel: String(payload.sourceLabel ?? "capture"),
           startedAt: Date.now(),
+          cloudSessionId: null,
         };
         sessionEvents = [];
         startClipboardWatcher();
+
+        const startToken = await getValidIdToken();
+        if (startToken) {
+          const cloud = await apiStartSession({
+            idToken: startToken,
+            sourceLabel: activeSession.sourceLabel,
+            sourceType: activeSession.sourceType,
+            localSessionId: activeSession.id,
+          });
+          if (cloud.ok) {
+            activeSession.cloudSessionId = cloud.sessionId;
+            console.info("[coco] cloud session started", cloud.sessionId);
+          } else {
+            console.warn("[coco] cloud session start failed", cloud.error);
+          }
+        }
+
         return activeSession;
       }
 
@@ -914,6 +1781,11 @@ function registerIpc(): void {
     isRecording = false;
   });
 
+  ipcMain.handle(
+    "session:end",
+    async (): Promise<EndSessionResult> => endSessionAndSynthesize(),
+  );
+
   ipcMain.handle("capture:screenshot", async () => captureScreenshot());
 
   ipcMain.handle(
@@ -931,16 +1803,65 @@ function registerIpc(): void {
 
   ipcMain.handle("notes:silent", async () => noteSilent());
 
+  ipcMain.handle(
+    "notes:save-text",
+    async (_event, text: string): Promise<NoteSilentResult> =>
+      saveNoteText(String(text ?? "")),
+  );
+
   ipcMain.handle("notes:get-events", () => sessionEvents);
 
   ipcMain.handle("notes:get-selection", () => currentSelection);
+
+  ipcMain.handle("ai:explain", async () => explainSelection());
+
+  ipcMain.handle(
+    "voice:transcribe",
+    async (
+      _event,
+      payload: { audioBase64: string; mimeType: string },
+    ): Promise<TranscribeResult> => transcribeVoice(payload),
+  );
+
+  ipcMain.handle(
+    "voice:speak",
+    async (_event, text: string): Promise<SpeakResult> =>
+      speakCloud(String(text ?? "")),
+  );
+
+  ipcMain.handle("auth:google-sign-in", async () => {
+    const config = readFirebaseConfigFromEnv();
+    if (!config) {
+      return {
+        ok: false as const,
+        error:
+          "Firebase .env values are empty. Paste the web config into VITE_FIREBASE_* keys, then restart.",
+      };
+    }
+
+    const result = await startGoogleSystemBrowserLogin(config);
+    if (!result.ok) return result;
+
+    authSession = withTokenExpiry(result.session);
+    await saveAuthSession(authSession);
+    return { ok: true as const, session: authSession };
+  });
+
+  ipcMain.handle("auth:get-session", () => authSession);
+
+  ipcMain.handle("auth:sign-out", async () => {
+    authSession = null;
+    await saveAuthSession(null);
+    return { ok: true as const };
+  });
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   if (process.platform === "darwin" && app.dock) {
     app.dock.hide();
   }
 
+  authSession = await loadAuthSession();
   configureMediaPermissions();
   registerIpc();
   registerCaptureHotkeys();

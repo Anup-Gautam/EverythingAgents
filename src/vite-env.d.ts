@@ -1,5 +1,19 @@
 /// <reference types="vite/client" />
 
+interface ImportMetaEnv {
+  readonly VITE_FIREBASE_API_KEY: string;
+  readonly VITE_FIREBASE_AUTH_DOMAIN: string;
+  readonly VITE_FIREBASE_PROJECT_ID: string;
+  readonly VITE_FIREBASE_STORAGE_BUCKET: string;
+  readonly VITE_FIREBASE_MESSAGING_SENDER_ID: string;
+  readonly VITE_FIREBASE_APP_ID: string;
+  readonly VITE_API_BASE_URL: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+
 type OrbBounds = {
   x: number;
   y: number;
@@ -9,12 +23,11 @@ type OrbBounds = {
 
 type MenuAction =
   | "end_session"
-  | "pause_capture"
-  | "open_past_sessions"
-  | "settings"
-  | "change_source";
+  | "change_source"
+  | "sign_in"
+  | "sign_out";
 
-type WindowLayout = "compact" | "picker" | "command";
+type WindowLayout = "compact" | "picker" | "command" | "remember";
 
 type SourceType = "screen" | "window";
 
@@ -38,28 +51,82 @@ type ActiveSession = {
   sourceType: SourceType;
   sourceLabel: string;
   startedAt: number;
+  cloudSessionId?: string | null;
 };
 
 type SessionEvent = {
   id: string;
-  type: "note_silent" | "screenshot" | "recording";
+  type: "note_silent" | "screenshot" | "recording" | "qa";
   timestamp: number;
   text?: string;
   filePath?: string;
   fileName?: string;
+  question?: string;
+  answer?: string;
+  label?: string;
 };
 
 type ScreenshotResult =
-  | { ok: true; filePath: string; fileName: string }
+  | {
+      ok: true;
+      filePath: string;
+      fileName: string;
+      cloudUploaded?: boolean;
+      cloudError?: string;
+      label?: string;
+    }
   | { ok: false; error: string };
 
 type RecordingSaveResult =
-  | { ok: true; filePath: string; fileName: string }
+  | { ok: true; filePath: string; fileName: string; label?: string }
   | { ok: false; error: string };
 
 type NoteSilentResult =
   | { ok: true; event: SessionEvent; preview: string }
   | { ok: false; error: string };
+
+type ExplainResult =
+  | { ok: true; answer: string; preview: string; model: string }
+  | { ok: false; error: string };
+
+type EndSessionResult =
+  | {
+      ok: true;
+      filePath: string;
+      fileName: string;
+      model: string | null;
+      eventCount: number;
+    }
+  | { ok: false; error: string };
+
+type TranscribeResult =
+  | { ok: true; transcript: string; model: string }
+  | { ok: false; error: string };
+
+type SpeakResult =
+  | {
+      ok: true;
+      audioBase64: string;
+      mimeType: string;
+      model: string;
+      provider?: string;
+    }
+  | { ok: false; error: string };
+
+type AuthSession = {
+  uid: string;
+  email: string | null;
+  displayName: string | null;
+  photoURL: string | null;
+  idToken: string;
+  refreshToken: string | null;
+  accessToken: string | null;
+  signedInAt: number;
+};
+
+type GoogleSignInResult =
+  | { ok: true; session: AuthSession }
+  | { ok: false; error: string; cancelled?: boolean };
 
 interface CocoApi {
   getBounds: () => Promise<OrbBounds>;
@@ -76,6 +143,7 @@ interface CocoApi {
     sourceLabel: string;
   }) => Promise<ActiveSession | null>;
   clearSession: () => Promise<void>;
+  endSession: () => Promise<EndSessionResult>;
   takeScreenshot: () => Promise<ScreenshotResult>;
   saveRecording: (payload: {
     bytes: ArrayBuffer;
@@ -83,8 +151,18 @@ interface CocoApi {
   }) => Promise<RecordingSaveResult>;
   setRecordingState: (recording: boolean) => void;
   noteSilent: () => Promise<NoteSilentResult>;
+  saveNoteText: (text: string) => Promise<NoteSilentResult>;
+  explain: () => Promise<ExplainResult>;
+  transcribeVoice: (payload: {
+    audioBase64: string;
+    mimeType: string;
+  }) => Promise<TranscribeResult>;
+  speakText: (text: string) => Promise<SpeakResult>;
   getSessionEvents: () => Promise<SessionEvent[]>;
   getCurrentSelection: () => Promise<string | null>;
+  signInWithGoogle: () => Promise<GoogleSignInResult>;
+  getAuthSession: () => Promise<AuthSession | null>;
+  signOut: () => Promise<{ ok: true }>;
   onMenuAction: (handler: (action: MenuAction) => void) => () => void;
   onScreenshotResult: (handler: (result: ScreenshotResult) => void) => () => void;
   onToggleRecording: (handler: () => void) => () => void;
@@ -92,6 +170,7 @@ interface CocoApi {
   onNoteSilentResult: (handler: (result: NoteSilentResult) => void) => () => void;
   onCommandToggle: (handler: () => void) => () => void;
   onPtt: (handler: () => void) => () => void;
+  onRemember: (handler: () => void) => () => void;
 }
 
 interface Window {

@@ -1,10 +1,11 @@
-/** Local Day-7 intent stubs — keyword matching only (no Gemini). */
+/** Local command matching (keyword only — no Gemini). */
 
 export type Intent =
   | "start_recording"
   | "stop_recording"
   | "capture_screenshot"
   | "note_silent"
+  | "remember"
   | "explain"
   | "end_session"
   | "unknown";
@@ -54,6 +55,13 @@ export function classifyCommand(input: string): ClassifiedCommand {
   }
 
   if (
+    /\b(remember|dictate|voice note|take a voice note)\b/.test(text) ||
+    text === "memo"
+  ) {
+    return { intent: "remember", confidence: "high", raw };
+  }
+
+  if (
     /\b(what does this mean|explain( this)?|what is this|eli5)\b/.test(text)
   ) {
     return { intent: "explain", confidence: "high", raw };
@@ -84,6 +92,8 @@ export function intentLabel(intent: Intent): string {
       return "Screenshot";
     case "note_silent":
       return "Note this";
+    case "remember":
+      return "Remember";
     case "explain":
       return "Explain";
     case "end_session":

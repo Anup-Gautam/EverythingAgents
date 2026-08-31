@@ -52,6 +52,114 @@ body,
   place-items: center;
 }
 
+.shell--remember {
+  padding-top: 14px;
+  gap: 6px;
+}
+
+.shell--remember .orb-wrap {
+  height: 118px;
+  align-content: start;
+  padding-top: 0;
+}
+
+.remember-mic {
+  position: absolute;
+  top: 74px;
+  left: 50%;
+  z-index: 4;
+  width: 36px;
+  height: 36px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  transform: translateX(-50%) translateY(-6px);
+  cursor: pointer;
+  color: #f4efea;
+  background: radial-gradient(
+    circle at 35% 30%,
+    rgba(210, 120, 120, 0.95) 0%,
+    #a84545 55%,
+    #6e2a2a 100%
+  );
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.12) inset,
+    0 4px 12px rgba(0, 0, 0, 0.35);
+  animation: remember-drop 220ms ease-out forwards;
+  -webkit-app-region: no-drag;
+}
+
+.remember-mic--active {
+  animation:
+    remember-drop 220ms ease-out forwards,
+    remember-glow 1.4s ease-in-out infinite;
+}
+
+.remember-mic:hover {
+  filter: brightness(1.08);
+}
+
+.remember-mic:active {
+  transform: translateX(-50%) translateY(-4px) scale(0.96);
+}
+
+.remember-mic__icon {
+  width: 18px;
+  height: 18px;
+  position: relative;
+  z-index: 1;
+}
+
+.remember-mic__pulse {
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(196, 91, 91, 0.55);
+  animation: remember-pulse 1.4s ease-out infinite;
+  pointer-events: none;
+}
+
+@keyframes remember-drop {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-18px) scale(0.85);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(-6px) scale(1);
+  }
+}
+
+@keyframes remember-pulse {
+  0% {
+    opacity: 0.7;
+    transform: scale(0.92);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.35);
+  }
+}
+
+@keyframes remember-glow {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 1px rgba(255, 255, 255, 0.12) inset,
+      0 4px 12px rgba(0, 0, 0, 0.35),
+      0 0 0 0 rgba(196, 91, 91, 0.35);
+  }
+  50% {
+    box-shadow:
+      0 0 0 1px rgba(255, 255, 255, 0.12) inset,
+      0 4px 12px rgba(0, 0, 0, 0.35),
+      0 0 14px 2px rgba(196, 91, 91, 0.4);
+  }
+}
+
 .orb {
   position: relative;
   z-index: 2;
@@ -253,7 +361,7 @@ body,
   }
 }
 
-/* Source picker (Day 3) */
+/* Source picker */
 .picker {
   flex: 1;
   min-height: 0;
@@ -431,7 +539,7 @@ body,
   flex: 0 0 auto;
 }
 
-/* Command bar (Day 7) */
+/* Command bar */
 .command {
   flex: 1;
   min-height: 0;
