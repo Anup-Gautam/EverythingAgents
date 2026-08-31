@@ -4,11 +4,9 @@ import multer from "multer";
 import admin from "firebase-admin";
 import { requireAuth } from "../auth";
 import { getBucket, getFirestore } from "../firebase";
-import {
-  getGeminiModelName,
-  synthesizeSessionNotes,
-  type SynthesisEvent,
-} from "../gemini";
+import { runSynthesizeNotesFlow } from "../flows/synthesizeNotes";
+import type { SynthesizeFlowEvent } from "../flows/synthesizeNotes";
+import { getGeminiModelName } from "../gemini";
 
 type StartSessionBody = {
   sourceLabel?: string;
@@ -22,9 +20,12 @@ type EventJsonBody = {
   fileName?: string;
   /** raw base64 or data-URL for PNG (curl-friendly) */
   imageBase64?: string;
+  /** raw base64 or data-URL for recording webm */
+  mediaBase64?: string;
   text?: string;
   question?: string;
   answer?: string;
+  label?: string;
   timestamp?: number;
 };
 
@@ -36,12 +37,12 @@ type SynthesizeBody = {
   sessionId?: string;
   sourceLabel?: string;
   startedAt?: number;
-  events?: SynthesisEvent[];
+  events?: SynthesizeFlowEvent[];
 };
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 8 * 1024 * 1024 },
+  limits: { fileSize: 40 * 1024 * 1024 },
 });
 
 export const sessionRouter = Router();
@@ -108,7 +109,7 @@ function decodeImageBase64(raw: string): Buffer {
 }
 
 /**
- * Session events: screenshot (GCS) | note_silent | qa
+ * Session events: screenshot | recording (GCS) | note_silent | qa (Firestore)
  * POST /session/event
  */
 sessionRouter.post(
@@ -132,9 +133,14 @@ sessionRouter.post(
         return;
       }
 
-      if (type !== "screenshot" && type !== "note_silent" && type !== "qa") {
+      if (
+        type !== "screenshot" &&
+        type !== "recording" &&
+        type !== "note_silent" &&
+        type !== "qa"
+      ) {
         res.status(400).json({
-          error: "Supported types: screenshot, note_silent, qa.",
+          error: "Supported types: screenshot, recording, note_silent, qa.",
         });
         return;
       }
@@ -191,11 +197,15 @@ sessionRouter.post(
         return;
       }
 
-      // screenshot
+      // screenshot | recording → GCS + Firestore metadata
+      const isRecording = type === "recording";
       let bytes: Buffer | null = null;
-      let contentType = "image/png";
+      let contentType = isRecording ? "video/webm" : "image/png";
       let fileName =
-        String(body.fileName ?? "").trim() || `screenshot-${Date.now()}.png`;
+        String(body.fileName ?? "").trim() ||
+        (isRecording
+          ? `recording-${Date.now()}.webm`
+          : `screenshot-${Date.now()}.png`);
 
       if (req.file?.buffer?.length) {
         bytes = req.file.buffer;
@@ -203,18 +213,24 @@ sessionRouter.post(
         if (req.file.originalname) {
           fileName = req.file.originalname;
         }
-      } else if (body.imageBase64) {
-        bytes = decodeImageBase64(body.imageBase64);
+      } else if (body.imageBase64 || body.mediaBase64) {
+        bytes = decodeImageBase64(
+          String(body.mediaBase64 || body.imageBase64 || ""),
+        );
       }
 
       if (!bytes || bytes.length === 0) {
         res.status(400).json({
-          error: "Missing screenshot file (multipart file or imageBase64).",
+          error: isRecording
+            ? "Missing recording file (multipart file or mediaBase64)."
+            : "Missing screenshot file (multipart file or imageBase64).",
         });
         return;
       }
 
-      const storagePath = `users/${user.uid}/sessions/${sessionId}/screenshots/${eventId}.png`;
+      const folder = isRecording ? "recordings" : "screenshots";
+      const ext = isRecording ? "webm" : "png";
+      const storagePath = `users/${user.uid}/sessions/${sessionId}/${folder}/${eventId}.${ext}`;
 
       const gcsFile = getBucket().file(storagePath);
       await gcsFile.save(bytes, {
@@ -227,6 +243,7 @@ sessionRouter.post(
             eventId,
             type,
             originalFileName: fileName,
+            label: String(body.label ?? "").trim() || "",
           },
         },
       });
@@ -235,11 +252,12 @@ sessionRouter.post(
         eventId,
         sessionId,
         userId: user.uid,
-        type: "screenshot" as const,
+        type: isRecording ? ("recording" as const) : ("screenshot" as const),
         fileName,
         contentType,
         byteSize: bytes.length,
         storagePath,
+        label: String(body.label ?? "").trim() || null,
         timestamp,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       };
@@ -252,7 +270,7 @@ sessionRouter.post(
       res.status(201).json({
         eventId,
         sessionId,
-        type: "screenshot",
+        type: eventDoc.type,
         storagePath,
         fileName,
         byteSize: bytes.length,
@@ -311,7 +329,7 @@ sessionRouter.post("/end", requireAuth, async (req, res) => {
 });
 
 /**
- * Build markdown notes from the client timeline (Gemini).
+ * Build markdown notes from the client timeline via Genkit + Gemini.
  * POST /session/synthesize
  */
 sessionRouter.post("/synthesize", requireAuth, async (req, res) => {
@@ -323,7 +341,7 @@ sessionRouter.post("/synthesize", requireAuth, async (req, res) => {
       return;
     }
 
-    const markdown = await synthesizeSessionNotes({
+    const result = await runSynthesizeNotesFlow({
       sourceLabel: body.sourceLabel,
       startedAt: body.startedAt,
       events: events.map((e) => ({
@@ -341,11 +359,33 @@ sessionRouter.post("/synthesize", requireAuth, async (req, res) => {
     const user = req.user;
     if (sessionId && user) {
       try {
+        const noteStoragePath = `users/${user.uid}/sessions/${sessionId}/notes/study-note.md`;
+        try {
+          await getBucket().file(noteStoragePath).save(result.markdown, {
+            resumable: false,
+            contentType: "text/markdown; charset=utf-8",
+            metadata: {
+              metadata: {
+                userId: user.uid,
+                sessionId,
+                framework: result.framework,
+                model: result.model || getGeminiModelName(),
+              },
+            },
+          });
+        } catch (err) {
+          console.warn("[coco-api] synthesize: could not upload note to GCS", err);
+        }
+
         await sessionRef(user.uid, sessionId).set(
           {
             status: "complete",
             finalNoteReady: true,
             synthesizedAt: Date.now(),
+            studyNoteMarkdown: result.markdown.slice(0, 200_000),
+            studyNoteModel: result.model || getGeminiModelName(),
+            studyNoteFramework: result.framework,
+            studyNoteStoragePath: noteStoragePath,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           },
           { merge: true },
@@ -356,8 +396,9 @@ sessionRouter.post("/synthesize", requireAuth, async (req, res) => {
     }
 
     res.json({
-      markdown,
-      model: getGeminiModelName(),
+      markdown: result.markdown,
+      model: result.model || getGeminiModelName(),
+      framework: result.framework,
       eventCount: events.length,
     });
   } catch (err) {

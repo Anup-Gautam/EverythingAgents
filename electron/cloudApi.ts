@@ -121,6 +121,56 @@ export async function apiUploadScreenshot(input: {
   }
 }
 
+export async function apiUploadRecording(input: {
+  idToken: string;
+  cloudSessionId: string;
+  fileName: string;
+  mediaBase64: string;
+  label?: string;
+  timestamp?: number;
+}): Promise<EventOk | EventErr> {
+  const base = resolveApiBaseUrl();
+  try {
+    const res = await fetch(`${base}/session/event`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${input.idToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        sessionId: input.cloudSessionId,
+        type: "recording",
+        fileName: input.fileName,
+        mediaBase64: input.mediaBase64,
+        label: input.label,
+        timestamp: input.timestamp,
+      }),
+    });
+    const data = (await res.json().catch(() => ({}))) as {
+      eventId?: string;
+      storagePath?: string;
+      error?: string;
+      detail?: string;
+    };
+    if (!res.ok || !data.eventId || !data.storagePath) {
+      return {
+        ok: false,
+        error: data.error || data.detail || `HTTP ${res.status}`,
+      };
+    }
+    return {
+      ok: true,
+      eventId: data.eventId,
+      storagePath: data.storagePath,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 export async function apiExplain(input: {
   idToken: string;
   text: string;

@@ -2,7 +2,9 @@
 
 Coco is a macOS floating **session companion orb**. Start a screen/window session, capture screenshots and recordings, save quotes, dictate voice notes (**Remember**), ask **Explain** on selected text, then end the session to get a structured study-note HTML pack.
 
-Stack: **Electron + React + Vite** (orb) · **Express** API on `:8080` · **Firebase Auth / Firestore / GCS** · **Gemini** (explain, captions, synthesize) · **Groq** STT · **Cartesia** TTS.
+Stack: **Electron + React + Vite** (orb) · **Express** API on `:8080` · **Firebase Auth / Firestore / GCS** · **Genkit + Gemini** (session synthesize) · **Gemini** (explain, captions) · **Groq** STT · **Cartesia** TTS.
+
+Architecture diagram: [docs/architecture.md](docs/architecture.md).
 
 ---
 
@@ -153,6 +155,8 @@ The source picker includes helpers to open Screen Recording settings.
 
 Captures also land in `~/Pictures/Coco/screenshots` and `~/Pictures/Coco/recordings`.
 
+**When signed in**, Firebase also stores that session in the cloud: notes and Q&A go to **Firestore**; screenshots, recordings, and the synthesized study note go to **GCS** (study-note markdown is also written on the Firestore session document).
+
 ---
 
 ## 5. Hotkeys
@@ -209,7 +213,7 @@ Then point `VITE_API_BASE_URL` at the service URL.
 ```text
 ├── src/                 # React orb UI
 ├── electron/            # Main process, IPC, notes HTML, cloud client
-├── backend/             # Express API (Gemini, Groq, Cartesia, Firebase)
+├── backend/             # Express API (Genkit synthesize, Gemini, Groq, Cartesia, Firebase)
 ├── scripts/             # Electron Info.plist screen-capture patch
 ├── .env.example         # Orb Firebase + API URL
 └── backend/.env.example # API keys + GCS + service account path

@@ -23,7 +23,7 @@ import { transcribeRouter } from "./routes/transcribe";
 const app = express();
 
 app.use(cors());
-app.use(express.json({ limit: "12mb" }));
+app.use(express.json({ limit: "40mb" }));
 
 function resolveSttProvider(): string {
   if (hasGroq()) return "groq";
@@ -70,8 +70,17 @@ app.get("/health", (_req, res) => {
     },
     notes: {
       synthesize: true,
+      synthesizeFramework: "genkit",
       caption: true,
       eventTypes: ["screenshot", "note_silent", "qa", "recording"],
+      cloudSync: [
+        "firestore_session",
+        "firestore_notes_qa",
+        "gcs_screenshots",
+        "gcs_recordings",
+        "firestore_study_note",
+        "gcs_study_note",
+      ],
       output: "html",
     },
   });
@@ -116,7 +125,7 @@ function main(): void {
     console.info("[coco-api] POST /session/start");
     console.info("[coco-api] POST /session/event");
     console.info("[coco-api] POST /session/end");
-    console.info("[coco-api] POST /session/synthesize");
+    console.info("[coco-api] POST /session/synthesize (Genkit + Gemini)");
     console.info("[coco-api] POST /explain");
     console.info("[coco-api] POST /caption");
     console.info("[coco-api] POST /transcribe");

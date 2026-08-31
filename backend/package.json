@@ -10,11 +10,15 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@genkit-ai/google-genai": "^1.41.0",
+    "@google-cloud/firestore": "^7.11.6",
+    "@google-cloud/storage": "^8.0.1",
     "@google/generative-ai": "^0.24.1",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "express": "^5.1.0",
     "firebase-admin": "^13.5.0",
+    "genkit": "^1.41.0",
     "multer": "^2.2.0"
   },
   "devDependencies": {

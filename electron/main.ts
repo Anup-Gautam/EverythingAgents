@@ -37,6 +37,7 @@ import {
   apiSynthesize,
   apiTranscribe,
   apiUploadScreenshot,
+  apiUploadRecording,
   apiUploadTextEvent,
 } from "./cloudApi";
 import { openNotesPackWindow, writeNotesHtml } from "./notesPack";
@@ -1512,6 +1513,27 @@ async function saveRecording(payload: {
           }
         } catch (err) {
           console.warn("[coco] recording caption error", err);
+        }
+      }
+
+      if (activeSession.cloudSessionId && captionToken) {
+        try {
+          const mediaBase64 = Buffer.from(payload.bytes).toString("base64");
+          const uploaded = await apiUploadRecording({
+            idToken: captionToken,
+            cloudSessionId: activeSession.cloudSessionId,
+            fileName,
+            mediaBase64,
+            label: event.label,
+            timestamp: event.timestamp,
+          });
+          if (uploaded.ok) {
+            console.info("[coco] recording uploaded", uploaded.storagePath);
+          } else {
+            console.warn("[coco] recording upload failed", uploaded.error);
+          }
+        } catch (err) {
+          console.warn("[coco] recording upload error", err);
         }
       }
 
