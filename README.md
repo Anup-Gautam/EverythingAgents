@@ -228,7 +228,3 @@ Then point `VITE_API_BASE_URL` at the service URL.
 | Orb won’t launch Electron correctly | Use `env -u ELECTRON_RUN_AS_NODE npm start` |
 
 ---
-
-## License
-
-Hackathon / private project — add a license if you open-source it.
